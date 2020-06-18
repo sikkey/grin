@@ -1,16 +1,25 @@
 [package]
 name = "grin_config"
-version = "0.1.0"
-authors = [" yeastplume"]
+version = "4.0.0-beta.2"
+authors = ["Grin Developers <mimblewimble@lists.launchpad.net>"]
+description = "Configuration for grin, a simple, private and scalable cryptocurrency implementation based on the Mimblewimble chain format."
+license = "Apache-2.0"
+repository = "https://github.com/mimblewimble/grin"
+keywords = [ "crypto", "grin", "mimblewimble" ]
 workspace = ".."
+edition = "2018"
 
 [dependencies]
-serde = "~1.0.8"
-serde_derive = "~1.0.8"
-toml = "0.4"
+rand = "0.6"
+serde = "1"
+serde_derive = "1"
+toml = "0.5"
+dirs = "2.0"
 
-grin_grin = { path = "../grin" }
-grin_pow = { path = "../pow"}
-grin_util = { path = "../util" }
-grin_p2p = { path = "../p2p" }
-grin_wallet = { path = "../wallet"}
+grin_core = { path = "../core", version = "4.0.0-beta.2" }
+grin_servers = { path = "../servers", version = "4.0.0-beta.2" }
+grin_p2p = { path = "../p2p", version = "4.0.0-beta.2" }
+grin_util = { path = "../util", version = "4.0.0-beta.2" }
+
+[dev-dependencies]
+pretty_assertions = "0.6.1"

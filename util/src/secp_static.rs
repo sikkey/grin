@@ -1,4 +1,4 @@
-// Copyright 2018 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,11 +13,12 @@
 // limitations under the License.
 
 //! Globally accessible static instance of secp256k1, to avoid
-//! initialisation overhead
+//! initialization overhead
 
-use std::sync::{Arc, Mutex};
-use rand::{thread_rng};
-use secp_ as secp;
+use crate::secp;
+use crate::Mutex;
+use rand::thread_rng;
+use std::sync::Arc;
 
 lazy_static! {
 	/// Static reference to secp instance
@@ -27,8 +28,13 @@ lazy_static! {
 
 /// Returns the static instance, but calls randomize on it as well
 /// (Recommended to avoid side channel attacks
-pub fn static_secp_instance()-> Arc<Mutex<secp::Secp256k1>>{
-	let mut secp_inst=SECP256K1.lock().unwrap();
+pub fn static_secp_instance() -> Arc<Mutex<secp::Secp256k1>> {
+	let mut secp_inst = SECP256K1.lock();
 	secp_inst.randomize(&mut thread_rng());
 	SECP256K1.clone()
+}
+
+/// Convenient way to generate a commitment to zero.
+pub fn commit_to_zero_value() -> secp::pedersen::Commitment {
+	secp::pedersen::Commitment::from_vec(vec![0])
 }

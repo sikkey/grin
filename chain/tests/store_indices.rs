@@ -1,4 +1,4 @@
-// Copyright 2017 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,48 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-extern crate env_logger;
-extern crate grin_chain as chain;
-extern crate grin_core as core;
-extern crate grin_keychain as keychain;
-extern crate rand;
+use self::core::core::hash::Hashed;
+use grin_core as core;
+use grin_util as util;
 
-use std::fs;
+mod chain_test_helper;
 
-use chain::ChainStore;
-use core::core::hash::Hashed;
-use core::core::{Block, BlockHeader};
-use keychain::Keychain;
-
-fn clean_output_dir(dir_name: &str) {
-	let _ = fs::remove_dir_all(dir_name);
-}
+use self::chain_test_helper::{clean_output_dir, mine_chain};
 
 #[test]
-fn test_various_store_indices() {
-	let _ = env_logger::init();
-	clean_output_dir(".grin");
+fn test_store_indices() {
+	util::init_test_logger();
 
-	let keychain = Keychain::from_random_seed().unwrap();
-	let key_id = keychain.derive_key_id(1).unwrap();
+	let chain_dir = ".grin_idx_1";
+	clean_output_dir(chain_dir);
 
-	let chain_store = &chain::store::ChainKVStore::new(".grin".to_string()).unwrap() as &ChainStore;
+	let chain = mine_chain(chain_dir, 4);
 
-	let block = Block::new(&BlockHeader::default(), vec![], &keychain, &key_id).unwrap();
-	let commit = block.outputs[0].commitment();
-	let block_hash = block.hash();
+	// Check head exists in the db.
+	assert_eq!(chain.head().unwrap().height, 3);
 
-	chain_store.save_block(&block).unwrap();
-	chain_store.setup_height(&block.header).unwrap();
+	// Check the header exists in the db.
+	assert_eq!(chain.head_header().unwrap().height, 3);
 
-	let block_header = chain_store.get_block_header(&block_hash).unwrap();
-	assert_eq!(block_header.hash(), block_hash);
+	// Check header_by_height index.
+	let block_header = chain.get_header_by_height(3).unwrap();
+	let block_hash = block_header.hash();
+	assert_eq!(block_hash, chain.head().unwrap().last_block_h);
 
-	let block_header = chain_store.get_header_by_height(1).unwrap();
-	assert_eq!(block_header.hash(), block_hash);
+	{
+		// Block exists in the db.
+		assert_eq!(chain.get_block(&block_hash).unwrap().hash(), block_hash);
 
-	let block_header = chain_store
-		.get_block_header_by_output_commit(&commit)
-		.unwrap();
-	assert_eq!(block_header.hash(), block_hash);
+		// Check we have block_sums in the db.
+		assert!(chain.get_block_sums(&block_hash).is_ok());
+
+		{
+			// Start a new batch and delete the block.
+			let store = chain.store();
+			let batch = store.batch().unwrap();
+			assert!(batch.delete_block(&block_hash).is_ok());
+
+			// Block is deleted within this batch.
+			assert!(batch.get_block(&block_hash).is_err());
+		}
+
+		// Check the batch did not commit any changes to the store .
+		assert!(chain.get_block(&block_hash).is_ok());
+	}
+
+	// Cleanup chain directory
+	clean_output_dir(chain_dir);
 }

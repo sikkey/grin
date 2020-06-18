@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,247 +20,105 @@
 #![deny(unused_mut)]
 #![warn(missing_docs)]
 
-extern crate byteorder;
-extern crate env_logger;
+#[macro_use]
+extern crate log;
+use failure;
+#[macro_use]
+extern crate failure_derive;
+#[macro_use]
 extern crate grin_core as core;
 extern crate grin_util as util;
-extern crate libc;
-extern crate memmap;
-extern crate rocksdb;
-#[macro_use]
-extern crate slog;
 
-pub mod sumtree;
+//use grin_core as core;
 
-const SEP: u8 = ':' as u8;
+pub mod leaf_set;
+pub mod lmdb;
+pub mod pmmr;
+pub mod prune_list;
+pub mod types;
 
-use std::fmt;
-use std::iter::Iterator;
-use std::marker::PhantomData;
-use std::sync::RwLock;
+const SEP: u8 = b':';
 
 use byteorder::{BigEndian, WriteBytesExt};
-use rocksdb::{DBCompactionStyle, DBIterator, Direction, IteratorMode, WriteBatch, DB};
 
-use core::ser;
-
-/// Main error type for this crate.
-#[derive(Debug)]
-pub enum Error {
-	/// Couldn't find what we were looking for
-	NotFoundErr,
-	/// Wraps an error originating from RocksDB (which unfortunately returns
-	/// string errors).
-	RocksDbErr(String),
-	/// Wraps a serialization error for Writeable or Readable
-	SerErr(ser::Error),
-}
-
-impl fmt::Display for Error {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		match self {
-			&Error::NotFoundErr => write!(f, "Not Found"),
-			&Error::RocksDbErr(ref s) => write!(f, "RocksDb Error: {}", s),
-			&Error::SerErr(ref e) => write!(f, "Serialization Error: {}", e.to_string()),
-		}
-	}
-}
-
-impl From<rocksdb::Error> for Error {
-	fn from(e: rocksdb::Error) -> Error {
-		Error::RocksDbErr(e.to_string())
-	}
-}
-
-/// Thread-safe rocksdb wrapper
-pub struct Store {
-	rdb: RwLock<DB>,
-}
-
-unsafe impl Sync for Store {}
-unsafe impl Send for Store {}
-
-impl Store {
-	/// Opens a new RocksDB at the specified location.
-	pub fn open(path: &str) -> Result<Store, Error> {
-		let mut opts = rocksdb::Options::default();
-		opts.create_if_missing(true);
-		opts.set_compaction_style(DBCompactionStyle::Universal);
-		opts.set_max_open_files(256);
-		opts.set_use_fsync(false);
-		let db = try!(DB::open(&opts, &path));
-		Ok(Store {
-			rdb: RwLock::new(db),
-		})
-	}
-
-	/// Writes a single key/value pair to the db
-	pub fn put(&self, key: &[u8], value: Vec<u8>) -> Result<(), Error> {
-		let db = self.rdb.write().unwrap();
-		db.put(key, &value[..]).map_err(&From::from)
-	}
-
-	/// Writes a single key and its `Writeable` value to the db. Encapsulates
-	/// serialization.
-	pub fn put_ser<W: ser::Writeable>(&self, key: &[u8], value: &W) -> Result<(), Error> {
-		let ser_value = ser::ser_vec(value);
-		match ser_value {
-			Ok(data) => self.put(key, data),
-			Err(err) => Err(Error::SerErr(err)),
-		}
-	}
-
-	/// Gets a value from the db, provided its key
-	pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-		let db = self.rdb.read().unwrap();
-		db.get(key)
-			.map(|r| r.map(|o| o.to_vec()))
-			.map_err(From::from)
-	}
-
-	/// Gets a `Readable` value from the db, provided its key. Encapsulates
-	/// serialization.
-	pub fn get_ser<T: ser::Readable>(&self, key: &[u8]) -> Result<Option<T>, Error> {
-		self.get_ser_limited(key, 0)
-	}
-
-	/// Gets a `Readable` value from the db, provided its key, allowing to
-	/// extract only partial data. The underlying Readable size must align
-	/// accordingly. Encapsulates serialization.
-	pub fn get_ser_limited<T: ser::Readable>(
-		&self,
-		key: &[u8],
-		len: usize,
-	) -> Result<Option<T>, Error> {
-		let data = try!(self.get(key));
-		match data {
-			Some(val) => {
-				let mut lval = if len > 0 { &val[..len] } else { &val[..] };
-				let r = try!(ser::deserialize(&mut lval).map_err(Error::SerErr));
-				Ok(Some(r))
-			}
-			None => Ok(None),
-		}
-	}
-
-	/// Whether the provided key exists
-	pub fn exists(&self, key: &[u8]) -> Result<bool, Error> {
-		let db = self.rdb.read().unwrap();
-		db.get(key).map(|r| r.is_some()).map_err(From::from)
-	}
-
-	/// Deletes a key/value pair from the db
-	pub fn delete(&self, key: &[u8]) -> Result<(), Error> {
-		let db = self.rdb.write().unwrap();
-		db.delete(key).map_err(From::from)
-	}
-
-	/// Produces an iterator of `Readable` types moving forward from the
-	/// provided
-	/// key.
-	pub fn iter<T: ser::Readable>(&self, from: &[u8]) -> SerIterator<T> {
-		let db = self.rdb.read().unwrap();
-		SerIterator {
-			iter: db.iterator(IteratorMode::From(from, Direction::Forward)),
-			_marker: PhantomData,
-		}
-	}
-
-	/// Builds a new batch to be used with this store.
-	pub fn batch(&self) -> Batch {
-		Batch {
-			store: self,
-			batch: WriteBatch::default(),
-		}
-	}
-
-	fn write(&self, batch: WriteBatch) -> Result<(), Error> {
-		let db = self.rdb.write().unwrap();
-		db.write(batch).map_err(From::from)
-	}
-}
-
-/// Batch to write multiple Writeables to RocksDb in an atomic manner.
-pub struct Batch<'a> {
-	store: &'a Store,
-	batch: WriteBatch,
-}
-
-impl<'a> Batch<'a> {
-	/// Writes a single key and its `Writeable` value to the batch. The write
-	/// function must be called to "commit" the batch to storage.
-	pub fn put_ser<W: ser::Writeable>(mut self, key: &[u8], value: &W) -> Result<Batch<'a>, Error> {
-		let ser_value = ser::ser_vec(value);
-		match ser_value {
-			Ok(data) => {
-				self.batch.put(key, &data[..])?;
-				Ok(self)
-			}
-			Err(err) => Err(Error::SerErr(err)),
-		}
-	}
-
-	/// Delete a single key from the batch. The write function
-	/// must be called to "commit" the batch to storage.
-	pub fn delete(mut self, key: &[u8]) -> Result<Batch<'a>, Error> {
-		self.batch.delete(key)?;
-		Ok(self)
-	}
-
-	/// Writes the batch to RocksDb.
-	pub fn write(self) -> Result<(), Error> {
-		self.store.write(self.batch)
-	}
-}
-
-/// An iterator thad produces Readable instances back. Wraps the lower level
-/// DBIterator and deserializes the returned values.
-pub struct SerIterator<T>
-where
-	T: ser::Readable,
-{
-	iter: DBIterator,
-	_marker: PhantomData<T>,
-}
-
-impl<T> Iterator for SerIterator<T>
-where
-	T: ser::Readable,
-{
-	type Item = T;
-
-	fn next(&mut self) -> Option<T> {
-		let next = self.iter.next();
-		next.and_then(|r| {
-			let (_, v) = r;
-			ser::deserialize(&mut &v[..]).ok()
-		})
-	}
-}
+pub use crate::lmdb::*;
 
 /// Build a db key from a prefix and a byte vector identifier.
-pub fn to_key(prefix: u8, k: &mut Vec<u8>) -> Vec<u8> {
+pub fn to_key<K: AsRef<[u8]>>(prefix: u8, k: K) -> Vec<u8> {
+	let k = k.as_ref();
 	let mut res = Vec::with_capacity(k.len() + 2);
 	res.push(prefix);
 	res.push(SEP);
-	res.append(k);
+	res.extend_from_slice(k);
 	res
 }
 
+/// Build a db key from a prefix and a byte vector identifier and numeric identifier
+pub fn to_key_u64<K: AsRef<[u8]>>(prefix: u8, k: K, val: u64) -> Vec<u8> {
+	let k = k.as_ref();
+	let mut res = Vec::with_capacity(k.len() + 10);
+	res.push(prefix);
+	res.push(SEP);
+	res.extend_from_slice(k);
+	res.write_u64::<BigEndian>(val).unwrap();
+	res
+}
 /// Build a db key from a prefix and a numeric identifier.
-pub fn u64_to_key<'a>(prefix: u8, val: u64) -> Vec<u8> {
-	let mut u64_vec = vec![];
-	u64_vec.write_u64::<BigEndian>(val).unwrap();
-	u64_vec.insert(0, SEP);
-	u64_vec.insert(0, prefix);
-	u64_vec
+pub fn u64_to_key(prefix: u8, val: u64) -> Vec<u8> {
+	let mut res = Vec::with_capacity(10);
+	res.push(prefix);
+	res.push(SEP);
+	res.write_u64::<BigEndian>(val).unwrap();
+	res
 }
 
-/// unwraps the inner option by converting the none case to a not found error
-pub fn option_to_not_found<T>(res: Result<Option<T>, Error>) -> Result<T, Error> {
-	match res {
-		Ok(None) => Err(Error::NotFoundErr),
-		Ok(Some(o)) => Ok(o),
-		Err(e) => Err(e),
+use std::ffi::OsStr;
+use std::fs::{remove_file, rename, File};
+use std::path::Path;
+/// Creates temporary file with name created by adding `temp_suffix` to `path`.
+/// Applies writer function to it and renames temporary file into original specified by `path`.
+pub fn save_via_temp_file<F, P, E>(
+	path: P,
+	temp_suffix: E,
+	mut writer: F,
+) -> Result<(), std::io::Error>
+where
+	F: FnMut(Box<dyn std::io::Write>) -> Result<(), std::io::Error>,
+	P: AsRef<Path>,
+	E: AsRef<OsStr>,
+{
+	let temp_suffix = temp_suffix.as_ref();
+	assert!(!temp_suffix.is_empty());
+
+	let original = path.as_ref();
+	let mut _original = original.as_os_str().to_os_string();
+	_original.push(temp_suffix);
+	// Write temporary file
+	let temp_path = Path::new(&_original);
+	if temp_path.exists() {
+		remove_file(&temp_path)?;
 	}
+
+	let file = File::create(&temp_path)?;
+	writer(Box::new(file))?;
+
+	// Move temporary file into original
+	if original.exists() {
+		remove_file(&original)?;
+	}
+
+	rename(&temp_path, &original)?;
+
+	Ok(())
+}
+
+use croaring::Bitmap;
+use std::io::{self, Read};
+/// Read Bitmap from a file
+pub fn read_bitmap<P: AsRef<Path>>(file_path: P) -> io::Result<Bitmap> {
+	let mut bitmap_file = File::open(file_path)?;
+	let f_md = bitmap_file.metadata()?;
+	let mut buffer = Vec::with_capacity(f_md.len() as usize);
+	bitmap_file.read_to_end(&mut buffer)?;
+	Ok(Bitmap::deserialize(&buffer))
 }

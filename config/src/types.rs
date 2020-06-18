@@ -1,4 +1,4 @@
-// Copyright 2017 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,13 +14,12 @@
 
 //! Public types for config modules
 
-use std::path::PathBuf;
-use std::io;
 use std::fmt;
+use std::io;
+use std::path::PathBuf;
 
-use grin::ServerConfig;
-use pow::types::MinerConfig;
-use util::LoggingConfig;
+use crate::servers::ServerConfig;
+use crate::util::logger::LoggingConfig;
 
 /// Error type wrapping config errors.
 #[derive(Debug)]
@@ -39,13 +38,12 @@ pub enum ConfigError {
 }
 
 impl fmt::Display for ConfigError {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match *self {
 			ConfigError::ParseError(ref file_name, ref message) => write!(
 				f,
 				"Error parsing configuration file at {} - {}",
-				file_name,
-				message
+				file_name, message
 			),
 			ConfigError::FileIOError(ref file_name, ref message) => {
 				write!(f, "{} {}", message, file_name)
@@ -64,7 +62,7 @@ impl From<io::Error> for ConfigError {
 	fn from(error: io::Error) -> ConfigError {
 		ConfigError::FileIOError(
 			String::from(""),
-			String::from(format!("Error loading config file: {}", error)),
+			format!("Error loading config file: {}", error),
 		)
 	}
 }
@@ -76,14 +74,10 @@ impl From<io::Error> for ConfigError {
 /// as they tend to be quite nested in the code
 /// Most structs optional, as they may or may not
 /// be needed depending on what's being run
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct GlobalConfig {
 	/// Keep track of the file we've read
 	pub config_file_path: Option<PathBuf>,
-	/// keep track of whether we're using
-	/// a config file or just the defaults
-	/// for each member
-	pub using_config_file: bool,
 	/// Global member config
 	pub members: Option<ConfigMembers>,
 }
@@ -92,18 +86,11 @@ pub struct GlobalConfig {
 /// level GlobalConfigContainer options might want to keep
 /// internal state that we don't necessarily
 /// want serialised or deserialised
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ConfigMembers {
 	/// Server config
+	#[serde(default)]
 	pub server: ServerConfig,
-	/// Mining config
-	pub mining: Option<MinerConfig>,
 	/// Logging config
 	pub logging: Option<LoggingConfig>,
-
-	//removing wallet from here for now,
-	//as its concerns are separate from the server's, really
-	//given it needs to manage keys. It should probably
-	//stay command line only for the time being
-	//pub wallet: Option<WalletConfig>
 }

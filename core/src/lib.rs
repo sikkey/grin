@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Implementation of the MimbleWimble paper.
+//! Implementation of the Mimblewimble paper.
 //! https://download.wpsoftware.net/bitcoin/wizardry/mimblewimble.txt
 
 #![deny(non_upper_case_globals)]
@@ -22,27 +22,24 @@
 #![warn(missing_docs)]
 
 #[macro_use]
-extern crate bitflags;
-extern crate blake2_rfc as blake2;
-extern crate byteorder;
-extern crate grin_keychain as keychain;
-extern crate grin_util as util;
+extern crate enum_primitive;
 #[macro_use]
 extern crate lazy_static;
-extern crate num_bigint as bigint;
-extern crate rand;
-extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+use serde;
 #[macro_use]
-extern crate slog;
-extern crate time;
-
+extern crate log;
+use failure;
+#[macro_use]
+extern crate failure_derive;
 #[macro_use]
 pub mod macros;
 
 pub mod consensus;
 pub mod core;
 pub mod genesis;
-pub mod ser;
 pub mod global;
+pub mod libtx;
+pub mod pow;
+pub mod ser;

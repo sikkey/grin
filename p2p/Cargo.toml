@@ -1,26 +1,30 @@
 [package]
 name = "grin_p2p"
-version = "0.1.0"
-authors = ["Ignotus Peverell <igno.peverell@protonmail.com>"]
+version = "4.0.0-beta.2"
+authors = ["Grin Developers <mimblewimble@lists.launchpad.net>"]
+description = "Chain implementation for grin, a simple, private and scalable cryptocurrency implementation based on the Mimblewimble chain format."
+license = "Apache-2.0"
+repository = "https://github.com/mimblewimble/grin"
+keywords = [ "crypto", "grin", "mimblewimble" ]
 workspace = ".."
+edition = "2018"
 
 [dependencies]
-bitflags = "^0.7.0"
-byteorder = "^0.5"
-futures = "^0.1.15"
-slog = { version = "^2.0.12", features = ["max_level_trace", "release_max_level_trace"] }
-net2 = "0.2.0"
-rand = "^0.3"
-serde = "~1.0.8"
-serde_derive = "~1.0.8"
-bytes = "0.4.3"
-tokio-core="^0.1.1"
-tokio-timer="^0.1.0"
-tokio-io="^0.1"
-time = "^0.1"
-enum_primitive = "^0.1.0"
-num = "^0.1.36"
+bitflags = "1"
+enum_primitive = "0.1"
+lru-cache = "0.1"
+num = "0.2"
+rand = "0.6"
+serde = "1"
+serde_derive = "1"
+tempfile = "3.1"
+log = "0.4"
+chrono = { version = "0.4.11", features = ["serde"] }
 
-grin_core = { path = "../core" }
-grin_store = { path = "../store" }
-grin_util = { path = "../util" }
+grin_core = { path = "../core", version = "4.0.0-beta.2" }
+grin_store = { path = "../store", version = "4.0.0-beta.2" }
+grin_util = { path = "../util", version = "4.0.0-beta.2" }
+grin_chain = { path = "../chain", version = "4.0.0-beta.2" }
+
+[dev-dependencies]
+grin_pool = { path = "../pool", version = "4.0.0-beta.2" }

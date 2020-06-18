@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,31 +12,47 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-extern crate grin_chain as chain;
-extern crate grin_core as core;
-extern crate grin_pool as pool;
-extern crate grin_p2p as p2p;
-extern crate grin_store as store;
-extern crate grin_util as util;
+use grin_chain as chain;
+use grin_core as core;
+use grin_p2p as p2p;
+use grin_pool as pool;
 
-extern crate hyper;
-extern crate iron;
-extern crate mount;
+use grin_util as util;
+
+use failure;
 #[macro_use]
-extern crate router;
-extern crate serde;
+extern crate failure_derive;
+#[macro_use]
+extern crate lazy_static;
+
 #[macro_use]
 extern crate serde_derive;
 extern crate serde_json;
 #[macro_use]
-extern crate slog;
-extern crate urlencoded;
+extern crate log;
 
+#[macro_use]
+mod web;
+pub mod auth;
 pub mod client;
+mod foreign;
+mod foreign_rpc;
 mod handlers;
+mod owner;
+mod owner_rpc;
 mod rest;
+mod router;
 mod types;
 
-pub use handlers::start_rest_apis;
-pub use types::*;
-pub use rest::*;
+pub use crate::auth::{
+	BasicAuthMiddleware, BasicAuthURIMiddleware, GRIN_BASIC_REALM, GRIN_FOREIGN_BASIC_REALM,
+};
+pub use crate::foreign::Foreign;
+pub use crate::foreign_rpc::ForeignRpc;
+pub use crate::handlers::node_apis;
+pub use crate::owner::Owner;
+pub use crate::owner_rpc::OwnerRpc;
+pub use crate::rest::*;
+pub use crate::router::*;
+pub use crate::types::*;
+pub use crate::web::*;

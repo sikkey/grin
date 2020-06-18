@@ -1,6 +1,8 @@
 # Merkle Structures
 
-MimbleWimble is designed for users to verify the state of the system given
+*Read this in other languages: [Korean](merkle_KR.md), [简体中文](merkle_ZH-CN.md).*
+
+Mimblewimble is designed for users to verify the state of the system given
 only pruned data. To achieve this goal, all transaction data is committed
 to the blockchain by means of Merkle trees which should support efficient
 updates and serialization even when pruned.
@@ -10,7 +12,7 @@ proofs) have the ability to be summed in some way, so it makes sense to
 treat Merkle sum trees as the default option, and address the sums here.
 
 A design goal of Grin is that all structures be as easy to implement and
-as simple as possible. MimbleWimble introduces a lot of new cryptography
+as simple as possible. Mimblewimble introduces a lot of new cryptography
 so it should be made as easy to understand as possible. Its validation rules
 are simple to specify (no scripts) and Grin is written in a language with
 very explicit semantics, so simplicity is also good to achieve well-understood
@@ -32,13 +34,12 @@ The root sum should be equal to the sum of all excesses since the genesis.
 Design requirements:
 
 1. Efficient additions and updating from unspent to spent.
-2. Efficient proofs that a specific output was spent.
-3. Efficient storage of diffs between UTXO roots.
-4. Efficient tree storage even with missing data, even with millions of entries.
-5. If a node commits to NULL, it has no unspent children and its data should
+1. Efficient proofs that a specific output was spent.
+1. Efficient storage of diffs between UTXO roots.
+1. Efficient tree storage even with missing data, even with millions of entries.
+1. If a node commits to NULL, it has no unspent children and its data should
    eventually be able to be dropped forever.
-6. Support serializating and efficient merging of pruned trees from partial
-   archival nodes.
+1. Support for serialization and efficient merging of pruned trees from partial archival nodes.
 
 ### Output witnesses
 
@@ -49,8 +50,7 @@ than deleting it.
 
 Design requirements:
 
-1. Support serializating and efficient merging of pruned trees from partial
-   archival nodes.
+1. Support for serialization and efficient merging of pruned trees from partial archival nodes.
 
 ### Inputs and Outputs
 
@@ -60,13 +60,15 @@ a sum-tree over the commitments of outputs, and the negatives of the commitments
 of inputs.
 
 Input references are hashes of old commitments. It is a consensus rule that
-there are never two identical unspent outputs.
+all unspent outputs must be unique.
 
 The root sum should be equal to the sum of excesses for this block. See the
 next section.
 
 In general, validators will see either 100% of this Merkle tree or 0% of it,
-so it is compatible with any design. Design requirements:
+so it is compatible with any design. 
+
+Design requirements:
 
 1. Efficient inclusion proofs, for proof-of-publication.
 
@@ -81,9 +83,7 @@ archival nodes in the future we want to support efficient pruning.
 
 Design requirements:
 
-1. Support serializating and efficient merging of pruned trees from partial
-   archival nodes.
-
+1. Support for serialization and efficient merging of pruned trees from partial archival nodes.
 
 ## Proposed Merkle Structure
 
@@ -150,7 +150,6 @@ In the output set each node also commits to a sum of its unspent children, so
 a validator knows if it is missing data on unspent coins by checking whether or
 not this sum on a pruned node is zero.
 
-
 ## Algorithms
 
 (To appear alongside an implementation.)
@@ -160,7 +159,7 @@ not this sum on a pruned node is zero.
 The sum tree data structure allows the efficient storage of the output set and
 output witnesses while allowing immediate retrieval of a root hash or root sum
 (when applicable). However, the tree must contain every output commitment and
-witness hash in the system. This data too big to be permanently stored in
+witness hash in the system. This data is too big to be permanently stored in
 memory and too costly to be rebuilt from scratch at every restart, even if we
 consider pruning (at this time, Bitcoin has over 50M UTXOs which would require
 at least 3.2GB, assuming a couple hashes per UTXO). So we need an efficient way
@@ -173,4 +172,3 @@ additional index over the whole key space is required. As an MMR is an append
 only binary tree, we can find a key in the tree by its insertion position. So a
 full index of keys inserted in the tree (i.e. an output commitment) to their
 insertion positions is also required.
-

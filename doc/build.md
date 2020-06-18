@@ -1,141 +1,141 @@
 # Grin - Build, Configuration, and Running
 
-# Building
+*Read this in other languages: [Español](build_ES.md), [Korean](build_KR.md), [日本語](build_JP.md), [简体中文](build_ZH-CN.md).*
 
 ## Supported Platforms
 
-Note that it's still too early in development to declare 'officially supported' plaforms, but at the moment, the situation is:
+Longer term, most platforms will likely be supported to some extent.
+Grin's programming language `rust` has build targets for most platforms.
 
-* Linux - Primary platform (x86 only, at present), as most development and testing is happening here
-* Mac OS - Known to work, but may be slight hiccups
-* Windows - Known to compile, but working status unknown, and not a focus for the development team at present. Note that no mining plugins will be present on a Windows system after building Grin.
+What's working so far?
 
-The instructions below will assume a Linux system.
+* Linux x86\_64 and macOS [grin + mining + development]
+* Not Windows 10 yet [grin kind-of builds. No mining yet. Help wanted!]
 
-## Build Prerequisites
+## Requirements
 
-In order to compile and run Grin on your machine, you should have installed:
+* rust: Install using rustup: https://rustup.rs
+  * Grin currently does not support a minimum version of Rust, it is recommended to build using the latest version.
+  * If rust is already installed, you can update to the latest version by running `rustup update`.
+* clang
+* ncurses and libs (ncurses, ncursesw5)
+* zlib libs (zlib1g-dev or zlib-devel)
+* pkg-config
+* libssl-dev
+* linux-headers (reported needed on Alpine linux)
+* llvm
 
-* <b>Git</b> - to clone the repository
-* <b>cmake</b> - 3.2 or greater should be installed and on your $PATH. Used by the build to compile the mining plugins found in the included [Cuckoo Miner](https://github.com/mimblewimble/cuckoo-miner)
-* <b>Rust</b> - 1.21.0 or greater via [Rustup](https://www.rustup.rs/) - Can be installed via your package manager or manually via the following commands:
-```
-    curl https://sh.rustup.rs -sSf | sh
-    source $HOME/.cargo/env
-```
+For Debian-based distributions (Debian, Ubuntu, Mint, etc), all in one line (except Rust):
 
-## Build Instructions (Linux/Unix)
-
-
-### Clone Grin
-
-```
-    git clone https://github.com/mimblewimble/grin.git
+```sh
+apt install build-essential cmake git libgit2-dev clang libncurses5-dev libncursesw5-dev zlib1g-dev pkg-config libssl-dev llvm
 ```
 
-### Build Grin
-```
-    cd grin
-    #if running a testnet1 node, check out the correct branch:
-    git checkout milestone/testnet1 
-    cargo build
-```
+For Mac:
 
-### Cuckoo-Miner considerations
-
-If you're having issues with building cuckoo-miner plugins (which will usually manifest as a lot of C errors when building the `grin_pow` crate, you can turn mining plugin builds off by editing the file `pow/Cargo.toml' as follows:
-
-```
-#uncomment this feature to turn off plugin builds
-features=["no-plugin-build"]
+```sh
+xcode-select --install
+brew install --with-toolchain llvm
+brew install pkg-config
+brew install openssl
 ```
 
-This may help when building on 32 bit systems or non x86 architectures. You can still use the internal miner to mine by setting:
+## Build steps
 
-```
-use_cuckoo_miner = false
-```
-
-In `grin.toml`
-
-## What have I just built?
-
-Provided all of the prerequisites were installed and there were no issues, there should be 3 things in your project directory that you need to pay attention to in order to configure and run grin. These are:
-
-* The Grin binary, which should be located in your project directory as target/debug/grin
-
-* A set of mining plugins, which should be in the 'plugins' directory located next to the grin executable
-
-* A configuration file in the root project directory named grin.toml
-
-For the time being, it's recommended just to put the built version of grin on your path, e.g. via:
-
-```
-export PATH=/path/to/grin/dir/target/debug:$PATH
+```sh
+git clone https://github.com/mimblewimble/grin.git
+cd grin
+cargo build --release
 ```
 
-# Configuration
+Grin can also be built in debug mode (without the `--release` flag, but using the `--debug` or the `--verbose` flag) but this will render fast sync prohibitively slow due to the large overhead of cryptographic operations.
 
-Grin is currently configured via a combination of configuration file and command line switches, with any provided switches overriding the contents of the configuration file. To see a list of commands and switches use:
+## Build errors
 
+See [Troubleshooting](https://github.com/mimblewimble/docs/wiki/Troubleshooting)
+
+## What was built?
+
+A successful build gets you:
+
+* `target/release/grin` - the main grin binary
+
+All data, configuration and log files created and used by grin are located in the hidden
+`~/.grin` directory (under your user home directory) by default. You can modify all configuration
+values by editing the file `~/.grin/main/grin-server.toml`.
+
+It is also possible to have grin create its data files in the current directory. To do this, run
+
+```sh
+grin server config
 ```
+
+Which will generate a `grin-server.toml` file in the current directory, pre-configured to use
+the current directory for all of its data. Running grin from a directory that contains a
+`grin-server.toml` file will use the values in that file instead of the default
+`~/.grin/main/grin-server.toml`.
+
+While testing, put the grin binary on your path like this:
+
+```sh
+export PATH=`pwd`/target/release:$PATH
+```
+
+assuming you are running from the root directory of your Grin installation.
+
+You can then run `grin` directly (try `grin help` for more options).
+
+## Configuration
+
+Grin attempts to run with sensible defaults, and can be further configured via
+the `grin-server.toml` file. This file is generated by grin on its first run, and
+contains documentation on each available option.
+
+While it's recommended that you perform all grin server configuration via
+`grin-server.toml`, it's also possible to supply command line switches to grin that
+override any settings in the file.
+
+For help on grin commands and their switches, try:
+
+```sh
 grin help
+grin server --help
+grin client --help
 ```
 
-At startup, grin looks for a configuration file called 'grin.toml' in the following places in the following order, using the first one it finds:
+## Docker
 
-* The current working directory
-* The directory in which the grin executable is located
-* {USER_HOME}/.grin
-
-If no configuration file is found, command line switches must be given to grin in order to start it. If a configuration file is found but no command line switches are provided, grin starts in server mode using the values found in the configuration file.
-
-At present, the relevant modes of operation are 'server' and 'wallet'. When running in server mode, any command line switches provided will override the values found in the configuration file. Running in wallet mode does not currently use any values from the configuration file other than logging output parameters.
-
-# Running a Node
-
-The following are minimal instructions to get a testnet1 node up and running.
-
-After following the instructions above to build a testnet executable and ensuring it's on your system path, create two directories wherever you prefer. Call one 'wallet' and one 'server'.
-
-In the 'wallet' directory (preferably in a separate terminal window), run the following command to create a wallet seed:
-
+```sh
+docker build -t grin -f etc/Dockerfile .
 ```
-grin wallet init
+For floonet, use `etc/Dockerfile.floonet` instead
+
+You can bind-mount your grin cache to run inside the container.
+
+```sh
+docker run -it -d -v $HOME/.grin:/root/.grin grin
 ```
+If you prefer to use a docker named volume, you can pass `-v dotgrin:/root/.grin` instead.
+Using a named volume copies default configurations upon volume creation.
 
-Then, to run a publicly listening wallet receiver, run the following command:
+## Cross-platform builds
 
-```
-grin wallet -p password -e receive
-```
+Rust (cargo) can build grin for many platforms, so in theory running `grin`
+as a validating node on your low powered device might be possible.
+To cross-compile `grin` on a x86 Linux platform and produce ARM binaries,
+say, for a Raspberry Pi.
 
-Next, in the 'server' directory in another terminal window, copy the grin.toml file from the project root:
+## Using grin
 
-```
-cp /path/to/project/root/grin.toml .
-```
+The wiki page [Wallet User Guide](https://github.com/mimblewimble/docs/wiki/Wallet-User-Guide)
+and linked pages have more information on what features we have,
+troubleshooting, etc.
 
-Then, to start the server node:
-```
-grin server --mine run
-```
+## Mining in Grin
 
-The server should start, connect to the seed and any available peers, and place mining rewards into your running wallet listener.
+Please note that all mining functions for Grin have moved into a separate, standalone package called
+[grin-miner](https://github.com/mimblewimble/grin-miner). Once your Grin code node is up and running,
+you can start mining by building and running grin-miner against your running Grin node.
 
-From your 'wallet' directory, you should be able to check your wallet contents with the command:
-
-```
-grin wallet -p password info
-```
-as well as see the individual outputs with:
-```
-grin wallet -p password outputs
-```
-
-See [wallet](wallet.md) for more info on the various Grin wallet commands and options.
-
-For further information on a more complicated internal setup for testing, see the [local net documentation](local_net.md)
-
-The [grin.toml](../grin.toml) configuration file has further information about the various options available.
-
+For grin-miner to be able to communicate with your grin node, make sure that you have `enable_stratum_server = true`
+in your `grin-server.toml` configuration file and you have a wallet listener running (`grin-wallet listen`). 

@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,38 +22,36 @@
 
 #[macro_use]
 extern crate bitflags;
-extern crate bytes;
+
 #[macro_use]
 extern crate enum_primitive;
-extern crate futures;
+
 #[macro_use]
 extern crate grin_core as core;
-extern crate grin_store;
-extern crate grin_util as util;
-extern crate num;
-extern crate rand;
-extern crate serde;
+use grin_chain as chain;
+use grin_util as util;
+
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
-extern crate slog;
-extern crate time;
-extern crate tokio_core;
-extern crate tokio_io;
-extern crate tokio_timer;
+extern crate log;
 
 mod conn;
 pub mod handshake;
-mod rate_limit;
-mod msg;
+pub mod msg;
 mod peer;
+mod peers;
 mod protocol;
-mod server;
+mod serv;
 mod store;
-mod types;
+pub mod types;
 
-pub use server::{DummyAdapter, Server};
-pub use peer::Peer;
-pub use types::{Capabilities, Error, NetAdapter, P2PConfig, PeerInfo, FULL_HIST, FULL_NODE,
-                MAX_BLOCK_HEADERS, MAX_LOCATORS, MAX_PEER_ADDRS, UNKNOWN};
-pub use store::{PeerData, PeerStore, State};
+pub use crate::conn::SEND_CHANNEL_CAP;
+pub use crate::peer::Peer;
+pub use crate::peers::Peers;
+pub use crate::serv::{DummyAdapter, Server};
+pub use crate::store::{PeerData, State};
+pub use crate::types::{
+	Capabilities, ChainAdapter, Direction, Error, P2PConfig, PeerAddr, PeerInfo, ReasonForBan,
+	Seeding, TxHashSetRead, MAX_BLOCK_HEADERS, MAX_LOCATORS, MAX_PEER_ADDRS,
+};

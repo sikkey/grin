@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,53 +17,70 @@
 //! Primary hash function used in the protocol
 //!
 
-use std::cmp::min;
-use std::{fmt, ops};
-use std::convert::AsRef;
-
+use crate::ser::{self, Error, ProtocolVersion, Readable, Reader, Writeable, Writer};
 use blake2::blake2b::Blake2b;
-
-use consensus::VerifySortOrder;
-use ser::{self, AsFixedBytes, Error, Readable, Reader, Writeable, Writer};
-use util::LOGGER;
+use byteorder::{BigEndian, ByteOrder};
+use std::{cmp::min, convert::AsRef, fmt, ops};
+use util::ToHex;
 
 /// A hash consisting of all zeroes, used as a sentinel. No known preimage.
 pub const ZERO_HASH: Hash = Hash([0; 32]);
 
 /// A hash to uniquely (or close enough) identify one of the main blockchain
-/// constructs. Used pervasively for blocks, transactions and ouputs.
+/// constructs. Used pervasively for blocks, transactions and outputs.
 #[derive(Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash, Serialize, Deserialize)]
-pub struct Hash(pub [u8; 32]);
+pub struct Hash([u8; 32]);
+
+impl DefaultHashable for Hash {}
 
 impl fmt::Debug for Hash {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		for i in self.0[..4].iter().cloned() {
-			try!(write!(f, "{:02x}", i));
-		}
-		Ok(())
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let hash_hex = self.to_hex();
+		const NUM_SHOW: usize = 12;
+
+		write!(f, "{}", &hash_hex[..NUM_SHOW])
 	}
 }
 
 impl fmt::Display for Hash {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		fmt::Debug::fmt(self, f)
 	}
 }
 
 impl Hash {
+	/// A hash is 32 bytes.
+	pub const LEN: usize = 32;
+
 	/// Builds a Hash from a byte vector. If the vector is too short, it will be
 	/// completed by zeroes. If it's too long, it will be truncated.
-	pub fn from_vec(v: Vec<u8>) -> Hash {
-		let mut h = [0; 32];
-		for i in 0..min(v.len(), 32) {
-			h[i] = v[i];
-		}
+	pub fn from_vec(v: &[u8]) -> Hash {
+		let mut h = [0; Hash::LEN];
+		let copy_size = min(v.len(), Hash::LEN);
+		h[..copy_size].copy_from_slice(&v[..copy_size]);
 		Hash(h)
 	}
 
 	/// Converts the hash to a byte vector
 	pub fn to_vec(&self) -> Vec<u8> {
 		self.0.to_vec()
+	}
+
+	/// Returns a byte slice of the hash contents.
+	pub fn as_bytes(&self) -> &[u8] {
+		&self.0
+	}
+
+	/// Convert hex string back to hash.
+	pub fn from_hex(hex: &str) -> Result<Hash, Error> {
+		let bytes = util::from_hex(hex)
+			.map_err(|_| Error::HexError(format!("failed to decode {}", hex)))?;
+		Ok(Hash::from_vec(&bytes))
+	}
+
+	/// Most significant 64 bits
+	pub fn to_u64(&self) -> u64 {
+		BigEndian::read_u64(&self.0)
 	}
 }
 
@@ -114,12 +131,10 @@ impl AsRef<[u8]> for Hash {
 }
 
 impl Readable for Hash {
-	fn read(reader: &mut Reader) -> Result<Hash, ser::Error> {
-		let v = try!(reader.read_fixed_bytes(32));
+	fn read<R: Reader>(reader: &mut R) -> Result<Hash, ser::Error> {
+		let v = reader.read_fixed_bytes(32)?;
 		let mut a = [0; 32];
-		for i in 0..a.len() {
-			a[i] = v[i];
-		}
+		a.copy_from_slice(&v[..]);
 		Ok(Hash(a))
 	}
 }
@@ -127,6 +142,12 @@ impl Readable for Hash {
 impl Writeable for Hash {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), Error> {
 		writer.write_fixed_bytes(&self.0)
+	}
+}
+
+impl Default for Hash {
+	fn default() -> Hash {
+		ZERO_HASH
 	}
 }
 
@@ -146,14 +167,16 @@ impl HashWriter {
 	/// current state
 	pub fn into_hash(self) -> Hash {
 		let mut res = [0; 32];
-		(&mut res).copy_from_slice(self.state.finalize().as_bytes());
+		res.copy_from_slice(self.state.finalize().as_bytes());
 		Hash(res)
 	}
 }
 
 impl Default for HashWriter {
 	fn default() -> HashWriter {
-		HashWriter { state: Blake2b::new(32) }
+		HashWriter {
+			state: Blake2b::new(32),
+		}
 	}
 }
 
@@ -162,9 +185,13 @@ impl ser::Writer for HashWriter {
 		ser::SerializationMode::Hash
 	}
 
-	fn write_fixed_bytes<T: AsFixedBytes>(&mut self, b32: &T) -> Result<(), ser::Error> {
-		self.state.update(b32.as_ref());
+	fn write_fixed_bytes<T: AsRef<[u8]>>(&mut self, bytes: T) -> Result<(), ser::Error> {
+		self.state.update(bytes.as_ref());
 		Ok(())
+	}
+
+	fn protocol_version(&self) -> ProtocolVersion {
+		ProtocolVersion::local()
 	}
 }
 
@@ -172,39 +199,28 @@ impl ser::Writer for HashWriter {
 pub trait Hashed {
 	/// Obtain the hash of the object
 	fn hash(&self) -> Hash;
-	/// Hash the object together with another writeable object
-	fn hash_with<T: Writeable>(&self, other: T) -> Hash;
 }
 
-impl<W: ser::Writeable> Hashed for W {
+/// Implementing this trait enables the default
+/// hash implementation
+pub trait DefaultHashable: Writeable {}
+
+impl<D: DefaultHashable> Hashed for D {
 	fn hash(&self) -> Hash {
 		let mut hasher = HashWriter::default();
-		ser::Writeable::write(self, &mut hasher).unwrap();
-		let mut ret = [0; 32];
-		hasher.finalize(&mut ret);
-		Hash(ret)
-	}
-
-	fn hash_with<T: Writeable>(&self, other: T) -> Hash {
-		let mut hasher = HashWriter::default();
-		ser::Writeable::write(self, &mut hasher).unwrap();
-		trace!(LOGGER, "Hashing with additional data");
-		ser::Writeable::write(&other, &mut hasher).unwrap();
+		Writeable::write(self, &mut hasher).unwrap();
 		let mut ret = [0; 32];
 		hasher.finalize(&mut ret);
 		Hash(ret)
 	}
 }
 
-impl<T: Writeable> VerifySortOrder<T> for Vec<T> {
-	fn verify_sort_order(&self) -> Result<(), ser::Error> {
-		match self.iter()
-			.map(|item| item.hash())
-			.collect::<Vec<_>>()
-			.windows(2)
-			.any(|pair| pair[0] > pair[1]) {
-			true => Err(ser::Error::BadlySorted),
-			false => Ok(()),
-		}
-	}
-}
+impl<D: DefaultHashable> DefaultHashable for &D {}
+impl<D: DefaultHashable, E: DefaultHashable> DefaultHashable for (D, E) {}
+impl<D: DefaultHashable, E: DefaultHashable, F: DefaultHashable> DefaultHashable for (D, E, F) {}
+
+/// Implement Hashed trait for external types here
+impl DefaultHashable for util::secp::pedersen::RangeProof {}
+impl DefaultHashable for Vec<u8> {}
+impl DefaultHashable for u8 {}
+impl DefaultHashable for u64 {}

@@ -1,4 +1,4 @@
-// Copyright 2017 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,21 +14,28 @@
 
 //! Library module for the key holder functionalities provided by Grin.
 
-extern crate blake2_rfc as blake2;
-extern crate byteorder;
+use blake2_rfc as blake2;
+
+#[macro_use]
 extern crate grin_util as util;
-extern crate rand;
-extern crate serde;
+
 #[macro_use]
 extern crate serde_derive;
-extern crate serde_json;
+
 #[macro_use]
-extern crate slog;
+extern crate lazy_static;
 
-mod blind;
-mod extkey;
+mod base58;
+pub mod extkey_bip32;
+pub mod mnemonic;
+mod types;
+pub mod view_key;
 
-pub use blind::{BlindSum, BlindingFactor};
-pub use extkey::{ExtendedKey, Identifier, IDENTIFIER_SIZE};
 pub mod keychain;
-pub use keychain::{Error, Keychain};
+pub use crate::extkey_bip32::ChildNumber;
+pub use crate::keychain::ExtKeychain;
+pub use crate::types::{
+	BlindSum, BlindingFactor, Error, ExtKeychainPath, Identifier, Keychain, SwitchCommitmentType,
+	IDENTIFIER_SIZE,
+};
+pub use crate::view_key::ViewKey;

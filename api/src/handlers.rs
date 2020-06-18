@@ -1,4 +1,4 @@
-// Copyright 2017 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,327 +12,428 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::Read;
-use std::sync::{Arc, RwLock};
-use std::thread;
+pub mod blocks_api;
+pub mod chain_api;
+pub mod peers_api;
+pub mod pool_api;
+pub mod server_api;
+pub mod transactions_api;
+pub mod utils;
+pub mod version_api;
 
-use iron::prelude::*;
-use iron::Handler;
-use iron::status;
-use urlencoded::UrlEncodedQuery;
+use self::blocks_api::BlockHandler;
+use self::blocks_api::HeaderHandler;
+use self::chain_api::ChainCompactHandler;
+use self::chain_api::ChainHandler;
+use self::chain_api::ChainValidationHandler;
+use self::chain_api::KernelHandler;
+use self::chain_api::OutputHandler;
+use self::peers_api::PeerHandler;
+use self::peers_api::PeersAllHandler;
+use self::peers_api::PeersConnectedHandler;
+use self::pool_api::PoolInfoHandler;
+use self::pool_api::PoolPushHandler;
+use self::server_api::IndexHandler;
+use self::server_api::StatusHandler;
+use self::transactions_api::TxHashSetHandler;
+use self::version_api::VersionHandler;
+use crate::auth::{
+	BasicAuthMiddleware, BasicAuthURIMiddleware, GRIN_BASIC_REALM, GRIN_FOREIGN_BASIC_REALM,
+};
+use crate::chain;
+use crate::chain::{Chain, SyncState};
+use crate::core::core::verifier_cache::VerifierCache;
+use crate::foreign::Foreign;
+use crate::foreign_rpc::ForeignRpc;
+use crate::owner::Owner;
+use crate::owner_rpc::OwnerRpc;
+use crate::p2p;
+use crate::pool;
+use crate::pool::{BlockChain, PoolAdapter};
+use crate::rest::{ApiServer, Error, TLSConfig};
+use crate::router::ResponseFuture;
+use crate::router::{Router, RouterError};
+use crate::util::to_base64;
+use crate::util::RwLock;
+use crate::web::*;
+use easy_jsonrpc_mw::{Handler, MaybeReply};
+use hyper::{Body, Request, Response, StatusCode};
 use serde::Serialize;
-use serde_json;
+use std::net::SocketAddr;
+use std::sync::{Arc, Weak};
 
-use chain;
-use core::core::Transaction;
-use core::ser;
-use pool;
-use p2p;
-use rest::*;
-use util::secp::pedersen::Commitment;
-use types::*;
-use util;
-use util::LOGGER;
-
-
-// Supports retrieval of multiple outputs in a single request -
-// GET /v1/chain/utxos?id=xxx,yyy,zzz
-// GET /v1/chain/utxos?id=xxx&id=yyy&id=zzz
-struct UtxoHandler {
+/// Listener version, providing same API but listening for requests on a
+/// port and wrapping the calls
+pub fn node_apis<B, P, V>(
+	addr: &str,
 	chain: Arc<chain::Chain>,
-}
-
-impl UtxoHandler {
-	fn get_utxo(&self, id: &str) -> Result<Output, Error> {
-		debug!(LOGGER, "getting utxo: {}", id);
-		let c = util::from_hex(String::from(id)).map_err(|_| {
-			Error::Argument(format!("Not a valid commitment: {}", id))
-		})?;
-		let commit = Commitment::from_vec(c);
-
-		let out = self.chain
-			.get_unspent(&commit)
-			.map_err(|_| Error::NotFound)?;
-
-		let header = self.chain
-			.get_block_header_by_output_commit(&commit)
-			.map_err(|_| Error::NotFound)?;
-
-		Ok(Output::from_output(&out, &header, false))
-	}
-}
-
-impl Handler for UtxoHandler {
-	fn handle(&self, req: &mut Request) -> IronResult<Response> {
-		let mut commitments: Vec<&str> = vec![];
-		if let Ok(params) = req.get_ref::<UrlEncodedQuery>() {
-			if let Some(ids) = params.get("id") {
-				for id in ids {
-					for id in id.split(",") {
-						commitments.push(id.clone());
-					}
-				}
-			}
-		}
-
-		let mut utxos: Vec<Output> = vec![];
-		for commit in commitments {
-			if let Ok(out) = self.get_utxo(commit) {
-				utxos.push(out);
-			}
-		}
-		json_response(&utxos)
-	}
-}
-
-// Sum tree handler. Retrieve the roots:
-// GET /v1/sumtrees/roots
-//
-// Last inserted nodes::
-// GET /v1/sumtrees/lastutxos (gets last 10)
-// GET /v1/sumtrees/lastutxos?n=5
-// GET /v1/sumtrees/lastrangeproofs
-// GET /v1/sumtrees/lastkernels
-struct SumTreeHandler {
-	chain: Arc<chain::Chain>,
-}
-
-impl SumTreeHandler {
-	// gets roots
-	fn get_roots(&self) -> SumTrees {
-		SumTrees::from_head(self.chain.clone())
-	}
-
-	// gets last n utxos inserted in to the tree
-	fn get_last_n_utxo(&self, distance: u64) -> Vec<SumTreeNode> {
-		SumTreeNode::get_last_n_utxo(self.chain.clone(), distance)
-	}
-
-	// gets last n utxos inserted in to the tree
-	fn get_last_n_rangeproof(&self, distance: u64) -> Vec<SumTreeNode> {
-		SumTreeNode::get_last_n_rangeproof(self.chain.clone(), distance)
-	}
-
-	// gets last n utxos inserted in to the tree
-	fn get_last_n_kernel(&self, distance: u64) -> Vec<SumTreeNode> {
-		SumTreeNode::get_last_n_kernel(self.chain.clone(), distance)
-	}
-}
-
-impl Handler for SumTreeHandler {
-	fn handle(&self, req: &mut Request) -> IronResult<Response> {
-		let url = req.url.clone();
-		let mut path_elems = url.path();
-		if *path_elems.last().unwrap() == "" {
-			path_elems.pop();
-		}
-		// TODO: probably need to set a reasonable max limit here
-		let mut last_n = 10;
-		if let Ok(params) = req.get_ref::<UrlEncodedQuery>() {
-			if let Some(nums) = params.get("n") {
-				for num in nums {
-					if let Ok(n) = str::parse(num) {
-						last_n = n;
-					}
-				}
-			}
-		}
-		match *path_elems.last().unwrap() {
-			"roots" => json_response_pretty(&self.get_roots()),
-			"lastutxos" => json_response_pretty(&self.get_last_n_utxo(last_n)),
-			"lastrangeproofs" => json_response_pretty(&self.get_last_n_rangeproof(last_n)),
-			"lastkernels" => json_response_pretty(&self.get_last_n_kernel(last_n)),
-			_ => Ok(Response::with((status::BadRequest, ""))),
-		}
-	}
-}
-
-pub struct PeersAllHandler {
-	pub peer_store: Arc<p2p::PeerStore>,
-}
-
-impl Handler for PeersAllHandler {
-	fn handle(&self, _req: &mut Request) -> IronResult<Response> {
-		let peers = &self.peer_store.all_peers();
-		json_response_pretty(&peers)
-	}
-}
-
-pub struct PeersConnectedHandler {
-	pub p2p_server: Arc<p2p::Server>,
-}
-
-impl Handler for PeersConnectedHandler {
-	fn handle(&self, _req: &mut Request) -> IronResult<Response> {
-		let mut peers = vec![];
-		for p in &self.p2p_server.all_peers() {
-			let peer_info = p.info.clone();
-			peers.push(peer_info);
-		}
-		json_response(&peers)
-	}
-}
-
-// Chain handler. Get the head details.
-// GET /v1/chain
-pub struct ChainHandler {
-	pub chain: Arc<chain::Chain>,
-}
-
-impl ChainHandler {
-	fn get_tip(&self) -> Tip {
-		Tip::from_tip(self.chain.head().unwrap())
-	}
-}
-
-impl Handler for ChainHandler {
-	fn handle(&self, _req: &mut Request) -> IronResult<Response> {
-		json_response(&self.get_tip())
-	}
-}
-
-// Get basic information about the transaction pool.
-struct PoolInfoHandler<T> {
-	tx_pool: Arc<RwLock<pool::TransactionPool<T>>>,
-}
-
-impl<T> Handler for PoolInfoHandler<T>
+	tx_pool: Arc<RwLock<pool::TransactionPool<B, P, V>>>,
+	peers: Arc<p2p::Peers>,
+	sync_state: Arc<chain::SyncState>,
+	api_secret: Option<String>,
+	foreign_api_secret: Option<String>,
+	tls_config: Option<TLSConfig>,
+) -> Result<(), Error>
 where
-	T: pool::BlockChain + Send + Sync + 'static,
+	B: BlockChain + 'static,
+	P: PoolAdapter + 'static,
+	V: VerifierCache + 'static,
 {
-	fn handle(&self, _req: &mut Request) -> IronResult<Response> {
-		let pool = self.tx_pool.read().unwrap();
-		json_response(&PoolInfo {
-			pool_size: pool.pool_size(),
-			orphans_size: pool.orphans_size(),
-			total_size: pool.total_size(),
+	// Manually build router when getting rid of v1
+	//let mut router = Router::new();
+	let mut router = build_router(
+		chain.clone(),
+		tx_pool.clone(),
+		peers.clone(),
+		sync_state.clone(),
+	)
+	.expect("unable to build API router");
+
+	// Add basic auth to v1 API and owner v2 API
+	if let Some(api_secret) = api_secret {
+		let api_basic_auth =
+			"Basic ".to_string() + &to_base64(&("grin:".to_string() + &api_secret));
+		let basic_auth_middleware = Arc::new(BasicAuthMiddleware::new(
+			api_basic_auth,
+			&GRIN_BASIC_REALM,
+			Some("/v2/foreign".into()),
+		));
+		router.add_middleware(basic_auth_middleware);
+	}
+
+	let api_handler_v2 = OwnerAPIHandlerV2::new(
+		Arc::downgrade(&chain),
+		Arc::downgrade(&peers),
+		Arc::downgrade(&sync_state),
+	);
+	router.add_route("/v2/owner", Arc::new(api_handler_v2))?;
+
+	// Add basic auth to v2 foreign API only
+	if let Some(api_secret) = foreign_api_secret {
+		let api_basic_auth =
+			"Basic ".to_string() + &to_base64(&("grin:".to_string() + &api_secret));
+		let basic_auth_middleware = Arc::new(BasicAuthURIMiddleware::new(
+			api_basic_auth,
+			&GRIN_FOREIGN_BASIC_REALM,
+			"/v2/foreign".into(),
+		));
+		router.add_middleware(basic_auth_middleware);
+	}
+
+	let api_handler_v2 = ForeignAPIHandlerV2::new(
+		Arc::downgrade(&chain),
+		Arc::downgrade(&tx_pool),
+		Arc::downgrade(&sync_state),
+	);
+	router.add_route("/v2/foreign", Arc::new(api_handler_v2))?;
+
+	let mut apis = ApiServer::new();
+	warn!("Starting HTTP Node APIs server at {}.", addr);
+	let socket_addr: SocketAddr = addr.parse().expect("unable to parse socket address");
+	let api_thread = apis.start(socket_addr, router, tls_config);
+
+	warn!("HTTP Node listener started.");
+
+	match api_thread {
+		Ok(_) => Ok(()),
+		Err(e) => {
+			error!("HTTP API server failed to start. Err: {}", e);
+			Err(e)
+		}
+	}
+}
+
+/// V2 API Handler/Wrapper for owner functions
+pub struct OwnerAPIHandlerV2 {
+	pub chain: Weak<Chain>,
+	pub peers: Weak<p2p::Peers>,
+	pub sync_state: Weak<SyncState>,
+}
+
+impl OwnerAPIHandlerV2 {
+	/// Create a new owner API handler for GET methods
+	pub fn new(chain: Weak<Chain>, peers: Weak<p2p::Peers>, sync_state: Weak<SyncState>) -> Self {
+		OwnerAPIHandlerV2 {
+			chain,
+			peers,
+			sync_state,
+		}
+	}
+}
+
+impl crate::router::Handler for OwnerAPIHandlerV2 {
+	fn post(&self, req: Request<Body>) -> ResponseFuture {
+		let api = Owner::new(
+			self.chain.clone(),
+			self.peers.clone(),
+			self.sync_state.clone(),
+		);
+
+		Box::pin(async move {
+			match parse_body(req).await {
+				Ok(val) => {
+					let owner_api = &api as &dyn OwnerRpc;
+					let res = match owner_api.handle_request(val) {
+						MaybeReply::Reply(r) => r,
+						MaybeReply::DontReply => {
+							// Since it's http, we need to return something. We return [] because jsonrpc
+							// clients will parse it as an empty batch response.
+							serde_json::json!([])
+						}
+					};
+					Ok(json_response_pretty(&res))
+				}
+				Err(e) => {
+					error!("Request Error: {:?}", e);
+					Ok(create_error_response(e))
+				}
+			}
 		})
 	}
-}
 
-/// Dummy wrapper for the hex-encoded serialized transaction.
-#[derive(Serialize, Deserialize)]
-struct TxWrapper {
-	tx_hex: String,
-}
-
-// Push new transactions to our transaction pool, that should broadcast it
-// to the network if valid.
-struct PoolPushHandler<T> {
-	tx_pool: Arc<RwLock<pool::TransactionPool<T>>>,
-}
-
-impl<T> Handler for PoolPushHandler<T>
-where
-	T: pool::BlockChain + Send + Sync + 'static,
-{
-	fn handle(&self, req: &mut Request) -> IronResult<Response> {
-		let wrapper: TxWrapper = serde_json::from_reader(req.body.by_ref())
-			.map_err(|e| IronError::new(e, status::BadRequest))?;
-
-		let tx_bin = util::from_hex(wrapper.tx_hex).map_err(|_| {
-			Error::Argument(format!("Invalid hex in transaction wrapper."))
-		})?;
-
-		let tx: Transaction = ser::deserialize(&mut &tx_bin[..]).map_err(|_| {
-			Error::Argument("Could not deserialize transaction, invalid format.".to_string())
-		})?;
-
-		let source = pool::TxSource {
-			debug_name: "push-api".to_string(),
-			identifier: "?.?.?.?".to_string(),
-		};
-		info!(
-			LOGGER,
-			"Pushing transaction with {} inputs and {} outputs to pool.",
-			tx.inputs.len(),
-			tx.outputs.len()
-		);
-		self.tx_pool
-			.write()
-			.unwrap()
-			.add_to_memory_pool(source, tx)
-			.map_err(|e| {
-				Error::Internal(format!("Addition to transaction pool failed: {:?}", e))
-			})?;
-
-		Ok(Response::with(status::Ok))
+	fn options(&self, _req: Request<Body>) -> ResponseFuture {
+		Box::pin(async { Ok(create_ok_response("{}")) })
 	}
 }
 
-// Utility to serialize a struct into JSON and produce a sensible IronResult
-// out of it.
-fn json_response<T>(s: &T) -> IronResult<Response>
+/// V2 API Handler/Wrapper for foreign functions
+pub struct ForeignAPIHandlerV2<B, P, V>
 where
-	T: Serialize,
+	B: BlockChain,
+	P: PoolAdapter,
+	V: VerifierCache + 'static,
 {
-	match serde_json::to_string(s) {
-		Ok(json) => Ok(Response::with((status::Ok, json))),
-		Err(_) => Ok(Response::with((status::InternalServerError, ""))),
+	pub chain: Weak<Chain>,
+	pub tx_pool: Weak<RwLock<pool::TransactionPool<B, P, V>>>,
+	pub sync_state: Weak<SyncState>,
+}
+
+impl<B, P, V> ForeignAPIHandlerV2<B, P, V>
+where
+	B: BlockChain,
+	P: PoolAdapter,
+	V: VerifierCache + 'static,
+{
+	/// Create a new foreign API handler for GET methods
+	pub fn new(
+		chain: Weak<Chain>,
+		tx_pool: Weak<RwLock<pool::TransactionPool<B, P, V>>>,
+		sync_state: Weak<SyncState>,
+	) -> Self {
+		ForeignAPIHandlerV2 {
+			chain,
+			tx_pool,
+			sync_state,
+		}
+	}
+}
+
+impl<B, P, V> crate::router::Handler for ForeignAPIHandlerV2<B, P, V>
+where
+	B: BlockChain + 'static,
+	P: PoolAdapter + 'static,
+	V: VerifierCache + 'static,
+{
+	fn post(&self, req: Request<Body>) -> ResponseFuture {
+		let api = Foreign::new(
+			self.chain.clone(),
+			self.tx_pool.clone(),
+			self.sync_state.clone(),
+		);
+
+		Box::pin(async move {
+			match parse_body(req).await {
+				Ok(val) => {
+					let foreign_api = &api as &dyn ForeignRpc;
+					let res = match foreign_api.handle_request(val) {
+						MaybeReply::Reply(r) => r,
+						MaybeReply::DontReply => {
+							// Since it's http, we need to return something. We return [] because jsonrpc
+							// clients will parse it as an empty batch response.
+							serde_json::json!([])
+						}
+					};
+					Ok(json_response_pretty(&res))
+				}
+				Err(e) => {
+					error!("Request Error: {:?}", e);
+					Ok(create_error_response(e))
+				}
+			}
+		})
+	}
+
+	fn options(&self, _req: Request<Body>) -> ResponseFuture {
+		Box::pin(async { Ok(create_ok_response("{}")) })
 	}
 }
 
 // pretty-printed version of above
-fn json_response_pretty<T>(s: &T) -> IronResult<Response>
+fn json_response_pretty<T>(s: &T) -> Response<Body>
 where
 	T: Serialize,
 {
 	match serde_json::to_string_pretty(s) {
-		Ok(json) => Ok(Response::with((status::Ok, json))),
-		Err(_) => Ok(Response::with((status::InternalServerError, ""))),
+		Ok(json) => response(StatusCode::OK, json),
+		Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, ""),
 	}
 }
-/// Start all server HTTP handlers. Register all of them with Iron
-/// and runs the corresponding HTTP server.
-pub fn start_rest_apis<T>(
-	addr: String,
-	chain: Arc<chain::Chain>,
-	tx_pool: Arc<RwLock<pool::TransactionPool<T>>>,
-	p2p_server: Arc<p2p::Server>,
-	peer_store: Arc<p2p::PeerStore>,
-) where
-	T: pool::BlockChain + Send + Sync + 'static,
-{
-	thread::spawn(move || {
-		// build handlers and register them under the appropriate endpoint
-		let utxo_handler = UtxoHandler {
-			chain: chain.clone(),
-		};
-		let chain_tip_handler = ChainHandler {
-			chain: chain.clone(),
-		};
-		let sumtree_handler = SumTreeHandler {
-			chain: chain.clone(),
-		};
-		let pool_info_handler = PoolInfoHandler {
-			tx_pool: tx_pool.clone(),
-		};
-		let pool_push_handler = PoolPushHandler {
-			tx_pool: tx_pool.clone(),
-		};
-		let peers_all_handler = PeersAllHandler {
-			peer_store: peer_store.clone(),
-		};
-		let peers_connected_handler = PeersConnectedHandler {
-			p2p_server: p2p_server.clone(),
-		};
 
-		let router = router!(
-			chain_tip: get "/chain" => chain_tip_handler,
-			chain_utxos: get "/chain/utxos" => utxo_handler,
-			sumtree_roots: get "/sumtrees/*" => sumtree_handler,
-			pool_info: get "/pool" => pool_info_handler,
-			pool_push: post "/pool/push" => pool_push_handler,
-			peers_all: get "/peers/all" => peers_all_handler,
-			peers_connected: get "/peers/connected" => peers_connected_handler,
+fn create_error_response(e: Error) -> Response<Body> {
+	Response::builder()
+		.status(StatusCode::INTERNAL_SERVER_ERROR)
+		.header("access-control-allow-origin", "*")
+		.header(
+			"access-control-allow-headers",
+			"Content-Type, Authorization",
+		)
+		.body(format!("{}", e).into())
+		.unwrap()
+}
+
+fn create_ok_response(json: &str) -> Response<Body> {
+	Response::builder()
+		.status(StatusCode::OK)
+		.header("access-control-allow-origin", "*")
+		.header(
+			"access-control-allow-headers",
+			"Content-Type, Authorization",
+		)
+		.header(hyper::header::CONTENT_TYPE, "application/json")
+		.body(json.to_string().into())
+		.unwrap()
+}
+
+/// Build a new hyper Response with the status code and body provided.
+///
+/// Whenever the status code is `StatusCode::OK` the text parameter should be
+/// valid JSON as the content type header will be set to `application/json'
+fn response<T: Into<Body>>(status: StatusCode, text: T) -> Response<Body> {
+	let mut builder = Response::builder();
+
+	builder = builder
+		.status(status)
+		.header("access-control-allow-origin", "*")
+		.header(
+			"access-control-allow-headers",
+			"Content-Type, Authorization",
 		);
 
-		let mut apis = ApiServer::new("/v1".to_string());
-		apis.register_handler(router);
+	if status == StatusCode::OK {
+		builder = builder.header(hyper::header::CONTENT_TYPE, "application/json");
+	}
 
-		info!(LOGGER, "Starting HTTP API server at {}.", addr);
-		apis.start(&addr[..]).unwrap_or_else(|e| {
-			error!(LOGGER, "Failed to start API HTTP server: {}.", e);
-		});
-	});
+	builder.body(text.into()).unwrap()
+}
+
+// Legacy V1 router
+#[deprecated(
+	since = "4.0.0",
+	note = "The V1 Node API will be removed in grin 5.0.0. Please migrate to the V2 API as soon as possible."
+)]
+pub fn build_router<B, P, V>(
+	chain: Arc<chain::Chain>,
+	tx_pool: Arc<RwLock<pool::TransactionPool<B, P, V>>>,
+	peers: Arc<p2p::Peers>,
+	sync_state: Arc<chain::SyncState>,
+) -> Result<Router, RouterError>
+where
+	B: BlockChain + 'static,
+	P: PoolAdapter + 'static,
+	V: VerifierCache + 'static,
+{
+	let route_list = vec![
+		"get blocks".to_string(),
+		"get headers".to_string(),
+		"get chain".to_string(),
+		"post chain/compact".to_string(),
+		"get chain/validate".to_string(),
+		"get chain/kernels/xxx?min_height=yyy&max_height=zzz".to_string(),
+		"get chain/outputs/byids?id=xxx,yyy,zzz".to_string(),
+		"get chain/outputs/byheight?start_height=101&end_height=200".to_string(),
+		"get status".to_string(),
+		"get txhashset/roots".to_string(),
+		"get txhashset/lastoutputs?n=10".to_string(),
+		"get txhashset/lastrangeproofs".to_string(),
+		"get txhashset/lastkernels".to_string(),
+		"get txhashset/outputs?start_index=1&max=100".to_string(),
+		"get txhashset/merkleproof?n=1".to_string(),
+		"get pool".to_string(),
+		"post pool/push_tx".to_string(),
+		"post peers/a.b.c.d:p/ban".to_string(),
+		"post peers/a.b.c.d:p/unban".to_string(),
+		"get peers/all".to_string(),
+		"get peers/connected".to_string(),
+		"get peers/a.b.c.d".to_string(),
+		"get version".to_string(),
+	];
+	let index_handler = IndexHandler { list: route_list };
+
+	let output_handler = OutputHandler {
+		chain: Arc::downgrade(&chain),
+	};
+	let kernel_handler = KernelHandler {
+		chain: Arc::downgrade(&chain),
+	};
+	let block_handler = BlockHandler {
+		chain: Arc::downgrade(&chain),
+	};
+	let header_handler = HeaderHandler {
+		chain: Arc::downgrade(&chain),
+	};
+	let chain_tip_handler = ChainHandler {
+		chain: Arc::downgrade(&chain),
+	};
+	let chain_compact_handler = ChainCompactHandler {
+		chain: Arc::downgrade(&chain),
+	};
+	let chain_validation_handler = ChainValidationHandler {
+		chain: Arc::downgrade(&chain),
+	};
+	let status_handler = StatusHandler {
+		chain: Arc::downgrade(&chain),
+		peers: Arc::downgrade(&peers),
+		sync_state: Arc::downgrade(&sync_state),
+	};
+	let txhashset_handler = TxHashSetHandler {
+		chain: Arc::downgrade(&chain),
+	};
+	let pool_info_handler = PoolInfoHandler {
+		tx_pool: Arc::downgrade(&tx_pool),
+	};
+	let pool_push_handler = PoolPushHandler {
+		tx_pool: Arc::downgrade(&tx_pool),
+	};
+	let peers_all_handler = PeersAllHandler {
+		peers: Arc::downgrade(&peers),
+	};
+	let peers_connected_handler = PeersConnectedHandler {
+		peers: Arc::downgrade(&peers),
+	};
+	let peer_handler = PeerHandler {
+		peers: Arc::downgrade(&peers),
+	};
+	let version_handler = VersionHandler {
+		chain: Arc::downgrade(&chain),
+	};
+
+	let mut router = Router::new();
+
+	router.add_route("/v1/", Arc::new(index_handler))?;
+	router.add_route("/v1/blocks/*", Arc::new(block_handler))?;
+	router.add_route("/v1/headers/*", Arc::new(header_handler))?;
+	router.add_route("/v1/chain", Arc::new(chain_tip_handler))?;
+	router.add_route("/v1/chain/outputs/*", Arc::new(output_handler))?;
+	router.add_route("/v1/chain/kernels/*", Arc::new(kernel_handler))?;
+	router.add_route("/v1/chain/compact", Arc::new(chain_compact_handler))?;
+	router.add_route("/v1/chain/validate", Arc::new(chain_validation_handler))?;
+	router.add_route("/v1/txhashset/*", Arc::new(txhashset_handler))?;
+	router.add_route("/v1/status", Arc::new(status_handler))?;
+	router.add_route("/v1/pool", Arc::new(pool_info_handler))?;
+	router.add_route("/v1/pool/push_tx", Arc::new(pool_push_handler))?;
+	router.add_route("/v1/peers/all", Arc::new(peers_all_handler))?;
+	router.add_route("/v1/peers/connected", Arc::new(peers_connected_handler))?;
+	router.add_route("/v1/peers/**", Arc::new(peer_handler))?;
+	router.add_route("/v1/version", Arc::new(version_handler))?;
+	Ok(router)
 }

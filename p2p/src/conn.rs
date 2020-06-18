@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,327 +14,374 @@
 
 //! Provides a connection wrapper that handles the lower level tasks in sending
 //! or receiving data from the TCP socket, as well as dealing with timeouts.
+//!
+//! Because of a few idiosyncracies in the Rust `TcpStream`, this has to use
+//! async I/O to be able to both read *and* write on the connection. Which
+//! forces us to go through some additional gymnastic to loop over the async
+//! stream and make sure we get the right number of bytes out.
 
-use std::iter;
-use std::ops::Deref;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use crate::core::ser;
+use crate::core::ser::ProtocolVersion;
+use crate::msg::{
+	read_body, read_discard, read_header, read_item, write_message, Msg, MsgHeader,
+	MsgHeaderWrapper,
+};
+use crate::types::Error;
+use crate::util::{RateCounter, RwLock};
+use std::io::{self, Read, Write};
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
+use std::{
+	cmp,
+	thread::{self, JoinHandle},
+};
 
-use futures;
-use futures::{Future, Stream};
-use futures::stream;
-use futures::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
-use tokio_core::net::TcpStream;
-use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_io::io::{read_exact, write_all};
-use tokio_timer::{Timer, TimerError};
+pub const SEND_CHANNEL_CAP: usize = 100;
 
-use core::core::hash::Hash;
-use core::ser;
-use msg::*;
-use types::Error;
-use rate_limit::*;
-use util::LOGGER;
+const HEADER_IO_TIMEOUT: Duration = Duration::from_millis(2000);
+const CHANNEL_TIMEOUT: Duration = Duration::from_millis(1000);
+const BODY_IO_TIMEOUT: Duration = Duration::from_millis(60000);
 
-/// Handler to provide to the connection, will be called back anytime a message
-/// is received. The provided sender can be use to immediately send back
-/// another message.
-pub trait Handler: Sync + Send {
-	/// Handle function to implement to process incoming messages. A sender to
-	/// reply immediately as well as the message header and its unparsed body
-	/// are provided.
-	fn handle(
+/// A trait to be implemented in order to receive messages from the
+/// connection. Allows providing an optional response.
+pub trait MessageHandler: Send + 'static {
+	fn consume<'a, R: Read>(
 		&self,
-		sender: UnboundedSender<Vec<u8>>,
-		header: MsgHeader,
-		body: Vec<u8>,
-	) -> Result<Option<Hash>, ser::Error>;
+		msg: Message<'a, R>,
+		stopped: Arc<AtomicBool>,
+		tracker: Arc<Tracker>,
+	) -> Result<Option<Msg>, Error>;
 }
 
-impl<F> Handler for F
-where
-	F: Fn(UnboundedSender<Vec<u8>>, MsgHeader, Vec<u8>)
-		-> Result<Option<Hash>, ser::Error>,
-	F: Sync + Send,
-{
-	fn handle(
-		&self,
-		sender: UnboundedSender<Vec<u8>>,
-		header: MsgHeader,
-		body: Vec<u8>,
-	) -> Result<Option<Hash>, ser::Error> {
-		self(sender, header, body)
-	}
-}
-
-/// A higher level connection wrapping the TcpStream. Maintains the amount of
-/// data transmitted and deals with the low-level task of sending and
-/// receiving data, parsing message headers and timeouts.
-#[allow(dead_code)]
-pub struct Connection {
-	// Channel to push bytes to the remote peer
-	outbound_chan: UnboundedSender<Vec<u8>>,
-
-	// Close the connection with the remote peer
-	close_chan: Sender<()>,
-
-	// Bytes we've sent.
-	sent_bytes: Arc<Mutex<u64>>,
-
-	// Bytes we've received.
-	received_bytes: Arc<Mutex<u64>>,
-
-	// Counter for read errors.
-	error_count: Mutex<u64>,
-}
-
-impl Connection {
-	/// Start listening on the provided connection and wraps it. Does not hang
-	/// the current thread, instead just returns a future and the Connection
-	/// itself.
-	pub fn listen<F>(
-		conn: TcpStream,
-		handler: F,
-	) -> (Connection, Box<Future<Item = (), Error = Error>>)
-	where
-		F: Handler + 'static,
-	{
-		let (reader, writer) = conn.split();
-
-		// Set Max Read to 12 Mb/s
-		let reader = ThrottledReader::new(reader, 12_000_000);
-		// Set Max Write to 12 Mb/s
-		let writer = ThrottledWriter::new(writer, 12_000_000);
-
-		// prepare the channel that will transmit data to the connection writer
-		let (tx, rx) = futures::sync::mpsc::unbounded();
-
-		// same for closing the connection
-		let (close_tx, close_rx) = futures::sync::mpsc::channel(1);
-		let close_conn = close_rx
-			.for_each(|_| Ok(()))
-			.map_err(|_| Error::ConnectionClose);
-
-		let me = Connection {
-			outbound_chan: tx.clone(),
-			close_chan: close_tx,
-			sent_bytes: Arc::new(Mutex::new(0)),
-			received_bytes: Arc::new(Mutex::new(0)),
-			error_count: Mutex::new(0),
-		};
-
-		// setup the reading future, getting messages from the peer and processing them
-		let read_msg = me.read_msg(tx, reader, handler).map(|_| ());
-
-		// setting the writing future, getting messages from our system and sending
-  // them out
-		let write_msg = me.write_msg(rx, writer).map(|_| ());
-
-		// select between our different futures and return them
-		let fut = Box::new(
-			close_conn
-				.select(read_msg.select(write_msg).map(|_| ()).map_err(|(e, _)| e))
-				.map(|_| ())
-				.map_err(|(e, _)| e),
-		);
-
-		(me, fut)
-	}
-
-	/// Prepares the future that gets message data produced by our system and
-	/// sends it to the peer connection
-	fn write_msg<W>(
-		&self,
-		rx: UnboundedReceiver<Vec<u8>>,
-		writer: W,
-	) -> Box<Future<Item = W, Error = Error>>
-	where
-		W: AsyncWrite + 'static,
-	{
-		let sent_bytes = self.sent_bytes.clone();
-		let send_data = rx
-			.map_err(|_| Error::ConnectionClose)
-      .map(move |data| {
-        // add the count of bytes sent
-				let mut sent_bytes = sent_bytes.lock().unwrap();
-				*sent_bytes += data.len() as u64;
-				data
-			})
-      // write the data and make sure the future returns the right types
-			.fold(writer, |writer, data| {
-        write_all(writer, data).map_err(|e| Error::Connection(e)).map(|(writer, _)| writer)
-      });
-		Box::new(send_data)
-	}
-
-	/// Prepares the future reading from the peer connection, parsing each
-	/// message and forwarding them appropriately based on their type
-	fn read_msg<F, R>(
-		&self,
-		sender: UnboundedSender<Vec<u8>>,
-		reader: R,
-		handler: F,
-	) -> Box<Future<Item = R, Error = Error>>
-	where
-		F: Handler + 'static,
-		R: AsyncRead + 'static,
-	{
-		// infinite iterator stream so we repeat the message reading logic until the
-  // peer is stopped
-		let iter = stream::iter_ok(iter::repeat(()).map(Ok::<(), Error>));
-
-		// setup the reading future, getting messages from the peer and processing them
-		let recv_bytes = self.received_bytes.clone();
-		let handler = Arc::new(handler);
-
-		let read_msg = iter.fold(reader, move |reader, _| {
-			let recv_bytes = recv_bytes.clone();
-			let handler = handler.clone();
-			let sender_inner = sender.clone();
-
-			// first read the message header
-			read_exact(reader, vec![0u8; HEADER_LEN as usize])
-				.from_err()
-				.and_then(move |(reader, buf)| {
-					let header = try!(ser::deserialize::<MsgHeader>(&mut &buf[..]));
-					Ok((reader, header))
-				})
-				.and_then(move |(reader, header)| {
-					// now that we have a size, proceed with the body
-					read_exact(reader, vec![0u8; header.msg_len as usize])
-						.map(|(reader, buf)| (reader, header, buf))
-						.from_err()
-				})
-				.and_then(move |(reader, header, buf)| {
-					// add the count of bytes received
-					let mut recv_bytes = recv_bytes.lock().unwrap();
-					*recv_bytes += header.serialized_len() + header.msg_len;
-
-					// and handle the different message types
-					let msg_type = header.msg_type;
-					if let Err(e) = handler.handle(sender_inner.clone(), header, buf) {
-						debug!(LOGGER, "Invalid {:?} message: {}", msg_type, e);
-						return Err(Error::Serialization(e));
-					}
-
-					Ok(reader)
-				})
-		});
-		Box::new(read_msg)
-	}
-
-	/// Utility function to send any Writeable. Handles adding the header and
-	/// serialization.
-	pub fn send_msg<W: ser::Writeable>(&self, t: Type, body: &W) -> Result<(), Error> {
-		let mut body_data = vec![];
-		try!(ser::serialize(&mut body_data, body));
-		let mut data = vec![];
-		try!(ser::serialize(
-			&mut data,
-			&MsgHeader::new(t, body_data.len() as u64),
-		));
-		data.append(&mut body_data);
-
-		self.outbound_chan
-			.unbounded_send(data)
-			.map_err(|_| Error::ConnectionClose)
-	}
-
-	/// Bytes sent and received by this peer to the remote peer.
-	pub fn transmitted_bytes(&self) -> (u64, u64) {
-		let sent = *self.sent_bytes.lock().unwrap();
-		let recv = *self.received_bytes.lock().unwrap();
-		(sent, recv)
-	}
-}
-
-/// Connection wrapper that handles a request/response oriented interaction with
-/// a timeout.
-pub struct TimeoutConnection {
-	underlying: Connection,
-
-	expected_responses: Arc<Mutex<Vec<(Type, Option<Hash>, Instant)>>>,
-}
-
-impl TimeoutConnection {
-	/// Same as Connection
-	pub fn listen<F>(
-		conn: TcpStream,
-		handler: F,
-	) -> (TimeoutConnection, Box<Future<Item = (), Error = Error>>)
-	where
-		F: Handler + 'static,
-	{
-		let expects = Arc::new(Mutex::new(vec![]));
-
-		// Decorates the handler to remove the "subscription" from the expected
-  // responses. We got our replies, so no timeout should occur.
-		let exp = expects.clone();
-		let (conn, fut) = Connection::listen(conn, move |sender, header: MsgHeader, data| {
-			let msg_type = header.msg_type;
-			let recv_h = try!(handler.handle(sender, header, data));
-
-			let mut expects = exp.lock().unwrap();
-			let filtered = expects
-				.iter()
-				.filter(|&&(typ, h, _): &&(Type, Option<Hash>, Instant)| {
-					msg_type != typ || h.is_some() && recv_h != h
-				})
-				.map(|&x| x)
-				.collect::<Vec<_>>();
-			*expects = filtered;
-
-			Ok(recv_h)
-		});
-
-		// Registers a timer with the event loop to regularly check for timeouts.
-		let exp = expects.clone();
-		let timer = Timer::default()
-			.interval(Duration::new(2, 0))
-			.fold((), move |_, _| {
-				let exp = exp.lock().unwrap();
-				for &(_, _, t) in exp.deref() {
-					if Instant::now() - t > Duration::new(2, 0) {
-						return Err(TimerError::TooLong);
-					}
+// Macro to simplify the boilerplate around I/O and Grin error handling
+macro_rules! try_break {
+	($inner:expr) => {
+		match $inner {
+			Ok(v) => Some(v),
+			Err(Error::Connection(ref e)) if e.kind() == io::ErrorKind::TimedOut => None,
+			Err(Error::Connection(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
+				// to avoid the heavy polling which will consume CPU 100%
+				thread::sleep(Duration::from_millis(10));
+				None
 				}
+			Err(Error::Store(_))
+			| Err(Error::Chain(_))
+			| Err(Error::Internal)
+			| Err(Error::NoDandelionRelay) => None,
+			Err(ref e) => {
+				debug!("try_break: exit the loop: {:?}", e);
+				break;
+				}
+			}
+	};
+}
+
+macro_rules! try_header {
+	($res:expr, $conn: expr) => {{
+		let _ = $conn.set_read_timeout(Some(HEADER_IO_TIMEOUT));
+		try_break!($res)
+		}};
+}
+
+/// A message as received by the connection. Provides access to the message
+/// header lazily consumes the message body, handling its deserialization.
+pub struct Message<'a, R: Read> {
+	pub header: MsgHeader,
+	stream: &'a mut R,
+	version: ProtocolVersion,
+}
+
+impl<'a, R: Read> Message<'a, R> {
+	fn from_header(header: MsgHeader, stream: &'a mut R, version: ProtocolVersion) -> Self {
+		Message {
+			header,
+			stream,
+			version,
+		}
+	}
+
+	/// Read the message body from the underlying connection
+	pub fn body<T: ser::Readable>(&mut self) -> Result<T, Error> {
+		read_body(&self.header, self.stream, self.version)
+	}
+
+	/// Read a single "thing" from the underlying connection.
+	/// Return the thing and the total bytes read.
+	pub fn streaming_read<T: ser::Readable>(&mut self) -> Result<(T, u64), Error> {
+		read_item(self.stream, self.version)
+	}
+
+	pub fn copy_attachment(&mut self, len: usize, writer: &mut dyn Write) -> Result<usize, Error> {
+		let mut written = 0;
+		while written < len {
+			let read_len = cmp::min(8000, len - written);
+			let mut buf = vec![0u8; read_len];
+			self.stream.read_exact(&mut buf[..])?;
+			writer.write_all(&buf)?;
+			written += read_len;
+		}
+		Ok(written)
+	}
+}
+
+pub struct StopHandle {
+	/// Channel to close the connection
+	stopped: Arc<AtomicBool>,
+	// we need Option to take ownhership of the handle in stop()
+	reader_thread: Option<JoinHandle<()>>,
+	writer_thread: Option<JoinHandle<()>>,
+}
+
+impl StopHandle {
+	/// Schedule this connection to safely close via the async close_channel.
+	pub fn stop(&self) {
+		self.stopped.store(true, Ordering::Relaxed);
+	}
+
+	pub fn wait(&mut self) {
+		if let Some(reader_thread) = self.reader_thread.take() {
+			self.join_thread(reader_thread);
+		}
+		if let Some(writer_thread) = self.writer_thread.take() {
+			self.join_thread(writer_thread);
+		}
+	}
+
+	fn join_thread(&self, peer_thread: JoinHandle<()>) {
+		// wait only if other thread is calling us, eg shutdown
+		if thread::current().id() != peer_thread.thread().id() {
+			debug!("waiting for thread {:?} exit", peer_thread.thread().id());
+			if let Err(e) = peer_thread.join() {
+				error!("failed to stop peer thread: {:?}", e);
+			}
+		} else {
+			debug!(
+				"attempt to stop thread {:?} from itself",
+				peer_thread.thread().id()
+			);
+		}
+	}
+}
+
+#[derive(Clone)]
+pub struct ConnHandle {
+	/// Channel to allow sending data through the connection
+	pub send_channel: mpsc::SyncSender<Msg>,
+}
+
+impl ConnHandle {
+	/// Send msg via the synchronous, bounded channel (sync_sender).
+	/// Two possible failure cases -
+	/// * Disconnected: Propagate this up to the caller so the peer connection can be closed.
+	/// * Full: Our internal msg buffer is full. This is not a problem with the peer connection
+	/// and we do not want to close the connection. We drop the msg rather than blocking here.
+	/// If the buffer is full because there is an underlying issue with the peer
+	/// and potentially the peer connection. We assume this will be handled at the peer level.
+	pub fn send(&self, msg: Msg) -> Result<(), Error> {
+		match self.send_channel.try_send(msg) {
+			Ok(()) => Ok(()),
+			Err(mpsc::TrySendError::Disconnected(_)) => {
+				Err(Error::Send("try_send disconnected".to_owned()))
+			}
+			Err(mpsc::TrySendError::Full(_)) => {
+				debug!("conn_handle: try_send but buffer is full, dropping msg");
 				Ok(())
-			})
-			.from_err();
+			}
+		}
+	}
+}
 
-		let me = TimeoutConnection {
-			underlying: conn,
-			expected_responses: expects,
-		};
-		(
-			me,
-			Box::new(fut.select(timer).map(|_| ()).map_err(|(e1, _)| e1)),
-		)
+pub struct Tracker {
+	/// Bytes we've sent.
+	pub sent_bytes: Arc<RwLock<RateCounter>>,
+	/// Bytes we've received.
+	pub received_bytes: Arc<RwLock<RateCounter>>,
+}
+
+impl Tracker {
+	pub fn new() -> Tracker {
+		let received_bytes = Arc::new(RwLock::new(RateCounter::new()));
+		let sent_bytes = Arc::new(RwLock::new(RateCounter::new()));
+		Tracker {
+			received_bytes,
+			sent_bytes,
+		}
 	}
 
-	/// Sends a request and registers a timer on the provided message type and
-	/// optionally the hash of the sent data.
-	pub fn send_request<W: ser::Writeable>(
-		&self,
-		t: Type,
-		rt: Type,
-		body: &W,
-		expect_h: Option<(Hash)>,
-	) -> Result<(), Error> {
-		let _sent = try!(self.underlying.send_msg(t, body));
-
-		let mut expects = self.expected_responses.lock().unwrap();
-		expects.push((rt, expect_h, Instant::now()));
-		Ok(())
+	pub fn inc_received(&self, size: u64) {
+		self.received_bytes.write().inc(size);
 	}
 
-	/// Same as Connection
-	pub fn send_msg<W: ser::Writeable>(&self, t: Type, body: &W) -> Result<(), Error> {
-		self.underlying.send_msg(t, body)
+	pub fn inc_sent(&self, size: u64) {
+		self.sent_bytes.write().inc(size);
 	}
 
-	/// Same as Connection
-	pub fn transmitted_bytes(&self) -> (u64, u64) {
-		self.underlying.transmitted_bytes()
+	pub fn inc_quiet_received(&self, size: u64) {
+		self.received_bytes.write().inc_quiet(size);
 	}
+
+	pub fn inc_quiet_sent(&self, size: u64) {
+		self.sent_bytes.write().inc_quiet(size);
+	}
+}
+
+/// Start listening on the provided connection and wraps it. Does not hang
+/// the current thread, instead just returns a future and the Connection
+/// itself.
+pub fn listen<H>(
+	stream: TcpStream,
+	version: ProtocolVersion,
+	tracker: Arc<Tracker>,
+	handler: H,
+) -> io::Result<(ConnHandle, StopHandle)>
+where
+	H: MessageHandler,
+{
+	let (send_tx, send_rx) = mpsc::sync_channel(SEND_CHANNEL_CAP);
+
+	let stopped = Arc::new(AtomicBool::new(false));
+
+	let conn_handle = ConnHandle {
+		send_channel: send_tx,
+	};
+
+	let (reader_thread, writer_thread) = poll(
+		stream,
+		conn_handle.clone(),
+		version,
+		handler,
+		send_rx,
+		stopped.clone(),
+		tracker,
+	)?;
+
+	Ok((
+		conn_handle,
+		StopHandle {
+			stopped,
+			reader_thread: Some(reader_thread),
+			writer_thread: Some(writer_thread),
+		},
+	))
+}
+
+fn poll<H>(
+	conn: TcpStream,
+	conn_handle: ConnHandle,
+	version: ProtocolVersion,
+	handler: H,
+	send_rx: mpsc::Receiver<Msg>,
+	stopped: Arc<AtomicBool>,
+	tracker: Arc<Tracker>,
+) -> io::Result<(JoinHandle<()>, JoinHandle<()>)>
+where
+	H: MessageHandler,
+{
+	// Split out tcp stream out into separate reader/writer halves.
+	let mut reader = conn.try_clone().expect("clone conn for reader failed");
+	let mut writer = conn.try_clone().expect("clone conn for writer failed");
+	let reader_stopped = stopped.clone();
+
+	let reader_tracker = tracker.clone();
+	let writer_tracker = tracker;
+
+	let reader_thread = thread::Builder::new()
+		.name("peer_read".to_string())
+		.spawn(move || {
+			loop {
+				// check the read end
+				match try_header!(read_header(&mut reader, version), &reader) {
+					Some(MsgHeaderWrapper::Known(header)) => {
+						let _ = reader.set_read_timeout(Some(BODY_IO_TIMEOUT));
+						let msg = Message::from_header(header, &mut reader, version);
+
+						trace!(
+							"Received message header, type {:?}, len {}.",
+							msg.header.msg_type,
+							msg.header.msg_len
+						);
+
+						// Increase received bytes counter
+						reader_tracker.inc_received(MsgHeader::LEN as u64 + msg.header.msg_len);
+
+						let resp_msg = try_break!(handler.consume(
+							msg,
+							reader_stopped.clone(),
+							reader_tracker.clone()
+						));
+						if let Some(Some(resp_msg)) = resp_msg {
+							try_break!(conn_handle.send(resp_msg));
+						}
+					}
+					Some(MsgHeaderWrapper::Unknown(msg_len, type_byte)) => {
+						debug!(
+							"Received unknown message header, type {:?}, len {}.",
+							type_byte, msg_len
+						);
+						// Increase received bytes counter
+						reader_tracker.inc_received(MsgHeader::LEN as u64 + msg_len);
+
+						try_break!(read_discard(msg_len, &mut reader));
+					}
+					None => {}
+				}
+
+				// check the close channel
+				if reader_stopped.load(Ordering::Relaxed) {
+					break;
+				}
+			}
+
+			debug!(
+				"Shutting down reader connection with {}",
+				reader
+					.peer_addr()
+					.map(|a| a.to_string())
+					.unwrap_or_else(|_| "?".to_owned())
+			);
+			let _ = reader.shutdown(Shutdown::Both);
+		})?;
+
+	let writer_thread = thread::Builder::new()
+		.name("peer_write".to_string())
+		.spawn(move || {
+			let mut retry_send = Err(());
+			let _ = writer.set_write_timeout(Some(BODY_IO_TIMEOUT));
+			loop {
+				let maybe_data = retry_send.or_else(|_| send_rx.recv_timeout(CHANNEL_TIMEOUT));
+				retry_send = Err(());
+				match maybe_data {
+					Ok(data) => {
+						let written =
+							try_break!(write_message(&mut writer, &data, writer_tracker.clone()));
+						if written.is_none() {
+							retry_send = Ok(data);
+						}
+					}
+					Err(RecvTimeoutError::Disconnected) => {
+						debug!("peer_write: mpsc channel disconnected during recv_timeout");
+						break;
+					}
+					Err(RecvTimeoutError::Timeout) => {}
+				}
+
+				// check the close channel
+				if stopped.load(Ordering::Relaxed) {
+					break;
+				}
+			}
+
+			debug!(
+				"Shutting down writer connection with {}",
+				writer
+					.peer_addr()
+					.map(|a| a.to_string())
+					.unwrap_or_else(|_| "?".to_owned())
+			);
+			let _ = writer.shutdown(Shutdown::Both);
+		})?;
+	Ok((reader_thread, writer_thread))
 }

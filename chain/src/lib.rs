@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,25 +22,34 @@
 
 #[macro_use]
 extern crate bitflags;
-extern crate byteorder;
-extern crate serde;
+
+#[macro_use]
+extern crate enum_primitive;
+
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
-extern crate slog;
-extern crate time;
+extern crate log;
 
-extern crate grin_core as core;
-extern crate grin_store;
-extern crate grin_util as util;
+use failure;
+use grin_core as core;
+use grin_keychain as keychain;
+use grin_util as util;
 
 mod chain;
+mod error;
+pub mod linked_list;
 pub mod pipe;
 pub mod store;
-pub mod sumtree;
+pub mod txhashset;
 pub mod types;
 
 // Re-export the base interface
 
-pub use chain::Chain;
-pub use types::{ChainAdapter, ChainStore, Error, Options, Tip, NONE, SKIP_POW, SYNC};
+pub use crate::chain::{Chain, MAX_ORPHAN_SIZE};
+pub use crate::error::{Error, ErrorKind};
+pub use crate::store::ChainStore;
+pub use crate::types::{
+	BlockStatus, ChainAdapter, Options, SyncState, SyncStatus, Tip, TxHashsetDownloadStats,
+	TxHashsetWriteStatus,
+};

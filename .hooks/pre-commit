@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2017 The Grin Developers
+# Copyright 2018 The Grin Developers
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,37 +14,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cargo +nightly fmt -- --version &>/dev/null
+rustfmt --version &>/dev/null
 if [ $? != 0 ]; then
-	printf "[pre_commit] \033[0;31merror\033[0m: \"cargo +nightly fmt\" not available?\n"
+	printf "[pre_commit] \033[0;31merror\033[0m: \"rustfmt\" not available. \n"
+	printf "[pre_commit] \033[0;31merror\033[0m: rustfmt can be installed via - \n"
+	printf "[pre_commit] $ rustup component add rustfmt-preview \n"
 	exit 1
 fi
 
-result=0
 problem_files=()
 
-printf "[pre_commit] rustfmt "
+# first collect all the files that need reformatting
 for file in $(git diff --name-only --cached); do
 	if [ ${file: -3} == ".rs" ]; then
-		cargo +nightly fmt -- --skip-children --write-mode=diff $file &>/dev/null
+		rustfmt --check $file &>/dev/null
 		if [ $? != 0 ]; then
 			problem_files+=($file)
-			result=1
 		fi
 	fi
 done
 
-if [ $result != 0 ]; then
-	printf "\033[0;31mfail\033[0m \n"
-	printf "[pre_commit] the following files need formatting: \n"
-
-	for file in $problem_files; do
-		printf "    cargo +nightly fmt -- $file\n"
-	done
+if [ ${#problem_files[@]} == 0 ]; then
+  # nothing to do
+  printf "[pre_commit] rustfmt \033[0;32mok\033[0m \n"
 else
-	printf "\033[0;32mok\033[0m \n"
+  # reformat the files that need it and re-stage them.
+	printf "[pre_commit] the following files were rustfmt'd before commit: \n"
+  for file in ${problem_files[@]}; do
+    rustfmt $file
+    git add $file
+		printf "\033[0;32m    $file\033[0m \n"
+  done
 fi
 
 exit 0
-# to actually fail the build on rustfmt failure -
-# exit $result

@@ -1,4 +1,4 @@
-// Copyright 2016 The Grin Developers
+// Copyright 2020 The Grin Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,77 +22,137 @@
 #![warn(missing_docs)]
 
 #[macro_use]
-extern crate slog;
-extern crate slog_async;
-extern crate slog_term;
-
-extern crate rand;
-
+extern crate log;
 #[macro_use]
 extern crate lazy_static;
-
-extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+// Re-export so only has to be included once
+pub use parking_lot::Mutex;
+pub use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // Re-export so only has to be included once
-pub extern crate secp256k1zkp as secp_;
-pub use secp_ as secp;
+pub use secp256k1zkp as secp;
 
 // Logging related
 pub mod logger;
-pub use logger::{init_logger, init_test_logger, LOGGER};
+pub use crate::logger::{init_logger, init_test_logger};
 
 // Static secp instance
 pub mod secp_static;
-pub use secp_static::static_secp_instance;
+pub use crate::secp_static::static_secp_instance;
 
 pub mod types;
-pub use types::LoggingConfig;
+pub use crate::types::ZeroingString;
+
+pub mod macros;
 
 // other utils
-use std::cell::{Ref, RefCell};
 #[allow(unused_imports)]
 use std::ops::Deref;
-
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 mod hex;
-pub use hex::*;
+pub use crate::hex::*;
 
-/// Encapsulation of a RefCell<Option<T>> for one-time initialization after
-/// construction. This implementation will purposefully fail hard if not used
-/// properly, for example if it's not initialized before being first used
+/// File util
+pub mod file;
+/// Compress and decompress zip bz2 archives
+pub mod zip;
+
+mod rate_counter;
+pub use crate::rate_counter::RateCounter;
+
+/// Encapsulation of a RwLock<Option<T>> for one-time initialization.
+/// This implementation will purposefully fail hard if not used
+/// properly, for example if not initialized before being first used
 /// (borrowed).
 #[derive(Clone)]
 pub struct OneTime<T> {
-	/// inner
-	inner: RefCell<Option<T>>,
+	/// The inner value.
+	inner: Arc<RwLock<Option<T>>>,
 }
 
-unsafe impl<T> Sync for OneTime<T> {}
-unsafe impl<T> Send for OneTime<T> {}
-
-impl<T> OneTime<T> {
+impl<T> OneTime<T>
+where
+	T: Clone,
+{
 	/// Builds a new uninitialized OneTime.
 	pub fn new() -> OneTime<T> {
 		OneTime {
-			inner: RefCell::new(None),
+			inner: Arc::new(RwLock::new(None)),
 		}
 	}
 
 	/// Initializes the OneTime, should only be called once after construction.
+	/// Will panic (via assert) if called more than once.
 	pub fn init(&self, value: T) {
-		let mut inner_mut = self.inner.borrow_mut();
-		*inner_mut = Some(value);
-	}
-
-	/// Whether the OneTime has been initialized
-	pub fn is_initialized(&self) -> bool {
-		let inner = self.inner.borrow();
-		inner.is_some()
+		let mut inner = self.inner.write();
+		assert!(inner.is_none());
+		*inner = Some(value);
 	}
 
 	/// Borrows the OneTime, should only be called after initialization.
-	pub fn borrow(&self) -> Ref<T> {
-		Ref::map(self.inner.borrow(), |o| o.as_ref().unwrap())
+	/// Will panic (via expect) if called before initialization.
+	pub fn borrow(&self) -> T {
+		let inner = self.inner.read();
+		inner
+			.clone()
+			.expect("Cannot borrow one_time before initialization.")
+	}
+
+	/// Has this OneTime been initialized?
+	pub fn is_init(&self) -> bool {
+		self.inner.read().is_some()
+	}
+}
+
+/// Encode an utf8 string to a base64 string
+pub fn to_base64(s: &str) -> String {
+	base64::encode(s)
+}
+
+/// Global stopped/paused state shared across various subcomponents of Grin.
+///
+/// "Stopped" allows a clean shutdown of the Grin server.
+/// "Paused" is used in some tests to allow nodes to reach steady state etc.
+///
+pub struct StopState {
+	stopped: AtomicBool,
+	paused: AtomicBool,
+}
+
+impl StopState {
+	/// Create a new stop_state in default "running" state.
+	pub fn new() -> StopState {
+		StopState {
+			stopped: AtomicBool::new(false),
+			paused: AtomicBool::new(false),
+		}
+	}
+
+	/// Check if we are stopped.
+	pub fn is_stopped(&self) -> bool {
+		self.stopped.load(Ordering::Relaxed)
+	}
+
+	/// Check if we are paused.
+	pub fn is_paused(&self) -> bool {
+		self.paused.load(Ordering::Relaxed)
+	}
+
+	/// Stop the server.
+	pub fn stop(&self) {
+		self.stopped.store(true, Ordering::Relaxed)
+	}
+
+	/// Pause the server (only used in tests).
+	pub fn pause(&self) {
+		self.paused.store(true, Ordering::Relaxed)
+	}
+
+	/// Resume a paused server (only used in tests).
+	pub fn resume(&self) {
+		self.paused.store(false, Ordering::Relaxed)
 	}
 }
